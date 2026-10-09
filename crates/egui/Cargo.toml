@@ -27,6 +27,9 @@ targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 [features]
 default = []
 
+## Retain backend-neutral resolved font providers for external glyph painting.
+glyph_paint = ["epaint/glyph_paint"]
+
 ## [`bytemuck`](https://docs.rs/bytemuck) enables you to cast [`epaint::Vertex`], [`emath::Vec2`] etc to `&[u8]`.
 bytemuck = ["epaint/bytemuck"]
 

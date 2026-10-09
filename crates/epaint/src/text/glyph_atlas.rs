@@ -51,8 +51,13 @@ pub struct GlyphAllocation {
 }
 
 /// An outline glyph in the atlas, positioned for one [`ShapedGlyph`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(feature = "glyph_paint"), derive(Copy))]
 pub(crate) struct OutlineGlyph {
+    /// Resolved source, retained independently of bitmap atlas allocation.
+    #[cfg(feature = "glyph_paint")]
+    pub paint_font: Option<std::sync::Arc<crate::text::FontPaintInstance>>,
+
     pub allocation: GlyphAllocation,
 
     /// Left edge of the glyph's pixel grid, in physical pixels.
@@ -316,7 +321,12 @@ impl GlyphAtlas {
                 .unwrap_or_default()
         });
 
-        OutlineGlyph { allocation, x_px }
+        OutlineGlyph {
+            allocation,
+            x_px,
+            #[cfg(feature = "glyph_paint")]
+            paint_font: Some(face.paint_instance(metrics)),
+        }
     }
 
     /// Get or rasterize `cluster` using the [`GlyphRasterizer`]s of the given `priority`.

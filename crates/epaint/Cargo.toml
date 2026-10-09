@@ -26,6 +26,10 @@ rustdoc-args = ["--generate-link-to-definition"]
 [features]
 default = []
 
+## Retain shared resolved font instances for external outline painting.
+## Bitmap rendering remains enabled; this does not select an external renderer.
+glyph_paint = []
+
 ## [`bytemuck`](https://docs.rs/bytemuck) enables you to cast [`Vertex`] to `&[u8]`.
 bytemuck = ["dep:bytemuck", "emath/bytemuck", "ecolor/bytemuck"]
 

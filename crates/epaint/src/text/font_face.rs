@@ -326,6 +326,10 @@ impl skrifa::outline::OutlinePen for VelloPen<'_> {
 pub struct FontFace {
     name: String,
     font: FontCell,
+    #[cfg(feature = "glyph_paint")]
+    paint_data: std::sync::Arc<super::font_paint::PaintFontData>,
+    #[cfg(feature = "glyph_paint")]
+    paint_instances: HashMap<skrifa::instance::Location, std::sync::Arc<super::FontPaintInstance>>,
     tweak: FontTweak,
     subpixel_binning: bool,
 
@@ -411,7 +415,17 @@ impl FontFace {
 
         let subpixel_binning = tweak.subpixel_binning.unwrap_or(options.subpixel_binning);
 
+        #[cfg(feature = "glyph_paint")]
+        let paint_data = std::sync::Arc::new(super::font_paint::PaintFontData::new(
+            std::sync::Arc::clone(font.borrow_owner()),
+            index,
+        )?);
+
         Ok(Self {
+            #[cfg(feature = "glyph_paint")]
+            paint_data,
+            #[cfg(feature = "glyph_paint")]
+            paint_instances: Default::default(),
             name,
             font,
             tweak,
@@ -420,6 +434,26 @@ impl FontFace {
             glyph_id_cache: Default::default(),
             advance_width_cache: Default::default(),
         })
+    }
+
+    /// Shared unhinted outline provider at this face's resolved variation location.
+    ///
+    /// Neither the size nor bitmap hinting options affect its identity.
+    #[cfg(feature = "glyph_paint")]
+    pub(crate) fn paint_instance(
+        &mut self,
+        metrics: &StyledMetrics,
+    ) -> std::sync::Arc<super::FontPaintInstance> {
+        if let Some(instance) = self.paint_instances.get(&metrics.location) {
+            return std::sync::Arc::clone(instance);
+        }
+        let instance = std::sync::Arc::new(super::FontPaintInstance::new(
+            std::sync::Arc::clone(&self.paint_data),
+            metrics.location.clone(),
+        ));
+        self.paint_instances
+            .insert(metrics.location.clone(), std::sync::Arc::clone(&instance));
+        instance
     }
 
     /// Apply new [`TextOptions`]: hinting on/off and sub-pixel binning.

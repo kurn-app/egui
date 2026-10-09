@@ -7,6 +7,8 @@ mod font_data;
 mod font_definitions;
 mod font_face;
 mod font_id;
+#[cfg(feature = "glyph_paint")]
+mod font_paint;
 mod font_provider;
 mod font_tweak;
 mod fonts;
@@ -79,3 +81,8 @@ impl Default for TextOptions {
         }
     }
 }
+
+#[cfg(feature = "glyph_paint")]
+pub use font_paint::{
+    FontInstanceId, FontPaintInstance, NormalizedCoord, OutlineDrawError, OutlinePen,
+};

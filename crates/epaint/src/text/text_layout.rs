@@ -347,7 +347,9 @@ fn layout_shaped_run(
                 }
                 let advance_width_px =
                     glyph_info.advance_width_unscaled.0 * fallback_metrics.px_scale_factor;
-                let OutlineGlyph { allocation, x_px } = allocate_glyph_info(
+                let OutlineGlyph {
+                    allocation, x_px, ..
+                } = allocate_glyph_info(
                     fonts,
                     fallback_key,
                     &fallback_metrics,
@@ -364,6 +366,7 @@ fn layout_shaped_run(
             let OutlineGlyph {
                 allocation: mut glyph_alloc,
                 x_px,
+                ..
             } = fonts.allocate_glyph(
                 run.font_key,
                 face_metrics,
@@ -412,6 +415,8 @@ fn allocate_glyph_info(
         return OutlineGlyph {
             allocation: GlyphAllocation::default(),
             x_px: h_pos_px.round() as i32,
+            #[cfg(feature = "glyph_paint")]
+            paint_font: None,
         };
     };
     fonts.allocate_glyph(
@@ -926,9 +931,12 @@ fn replace_last_glyph_with_overflow_character(
             let OutlineGlyph {
                 allocation: replacement_glyph_alloc,
                 x_px,
+                ..
             } = match &raster {
                 Some(raster) => OutlineGlyph {
                     allocation: raster.allocation,
+                    #[cfg(feature = "glyph_paint")]
+                    paint_font: None,
                     x_px: (overflow_glyph_x * pixels_per_point).round() as i32,
                 },
                 None => allocate_glyph_info(
