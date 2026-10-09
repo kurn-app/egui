@@ -39,6 +39,17 @@ pub struct TextShape {
     /// Rotate text by this many radians clockwise.
     /// The pivot is `pos` (the upper left corner of the text).
     pub angle: f32,
+
+    /// Accumulated scale from original shared row paint coordinates to rendering coordinates.
+    /// Row positions are already scaled by `transform`; paint occurrences remain shared.
+    #[cfg(feature = "glyph_paint")]
+    #[cfg_attr(feature = "serde", serde(default = "unit_paint_scale"))]
+    pub glyph_paint_scale: f32,
+}
+
+#[cfg(all(feature = "glyph_paint", feature = "serde"))]
+fn unit_paint_scale() -> f32 {
+    1.0
 }
 
 impl TextShape {
@@ -55,6 +66,8 @@ impl TextShape {
             override_text_color: None,
             opacity_factor: 1.0,
             angle: 0.0,
+            #[cfg(feature = "glyph_paint")]
+            glyph_paint_scale: 1.0,
         }
     }
 
@@ -106,6 +119,36 @@ impl TextShape {
         self
     }
 
+    /// Map an original row-local paint position to UI points.
+    /// `row.pos` already includes accumulated layer scaling. Rotation pivots at `self.pos`.
+    /// This does not apply the tessellator's optional final origin rounding to physical pixels.
+    #[cfg(feature = "glyph_paint")]
+    pub fn glyph_paint_pos(&self, row: &text::PlacedRow, local_pos: Pos2) -> Pos2 {
+        self.pos
+            + Rot2::from_angle(self.angle)
+                * (row.pos.to_vec2() + self.glyph_paint_scale * local_pos.to_vec2())
+    }
+
+    /// Resolve glyph paint color with the same placeholder, override, source-color
+    /// alpha, and gamma-space opacity rules as stock tessellation.
+    #[cfg(feature = "glyph_paint")]
+    pub fn glyph_paint_color(&self, paint: &text::GlyphPaint) -> Color32 {
+        let mut color = self.override_text_color.unwrap_or_else(|| {
+            if paint.color == Color32::PLACEHOLDER {
+                self.fallback_color
+            } else {
+                paint.color
+            }
+        });
+        if paint.is_color {
+            color = Color32::from_white_alpha(color.a());
+        }
+        if self.opacity_factor < 1.0 {
+            color = color.gamma_multiply(self.opacity_factor);
+        }
+        color
+    }
+
     /// Move the shape by this many points, in-place.
     pub fn transform(&mut self, transform: emath::TSTransform) {
         let Self {
@@ -116,7 +159,14 @@ impl TextShape {
             override_text_color: _,
             opacity_factor: _,
             angle: _,
+            #[cfg(feature = "glyph_paint")]
+            glyph_paint_scale,
         } = self;
+
+        #[cfg(feature = "glyph_paint")]
+        {
+            *glyph_paint_scale *= transform.scaling;
+        }
 
         *pos = transform * *pos;
         underline.width *= transform.scaling;
@@ -148,6 +198,8 @@ impl TextShape {
             let text::Row {
                 section_index_at_start: _,
                 glyphs: _, // TODO(emilk): would it make sense to transform these?
+                #[cfg(feature = "glyph_paint")]
+                    glyph_paint: _,
                 size,
                 visuals,
             } = Arc::make_mut(row);

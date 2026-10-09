@@ -2234,6 +2234,8 @@ impl Tessellator {
             fallback_color,
             opacity_factor,
             angle,
+            #[cfg(feature = "glyph_paint")]
+                glyph_paint_scale: _,
         } = text_shape;
 
         if galley.is_empty() {

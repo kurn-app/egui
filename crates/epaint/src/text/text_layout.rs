@@ -57,6 +57,138 @@ impl PointScale {
 
 // ----------------------------------------------------------------------------
 
+/// Temporary resolved paint arena. Logical glyphs carry only a Copy index.
+#[derive(Default)]
+struct PaintLayout {
+    #[cfg(feature = "glyph_paint")]
+    records: Vec<PendingPaint>,
+}
+
+#[cfg(feature = "glyph_paint")]
+struct PendingPaint {
+    font: Option<Arc<super::FontPaintInstance>>,
+    glyph_id: Option<u32>,
+    source: super::GlyphPaintSource,
+    x_delta: f32,
+    y_tweak: f32,
+    offset: Vec2,
+    scale: Vec2,
+    outline_bounds: Rect,
+}
+
+#[cfg(feature = "glyph_paint")]
+impl PaintLayout {
+    fn outline(
+        &mut self,
+        glyph: &mut Glyph,
+        outline: &OutlineGlyph,
+        glyph_id: Option<skrifa::GlyphId>,
+        metrics: &StyledMetrics,
+        origin_px: f32,
+        offset_px: Vec2,
+    ) {
+        if outline.paint_font.is_none() || super::unicode::invisible_char(glyph.chr) {
+            return; // Invisible/control records have no resolved paint occurrence.
+        }
+        let scale = metrics.px_scale_factor / metrics.pixels_per_point;
+        glyph.paint_index =
+            u32::try_from(self.records.len()).expect("too many glyph paint records");
+        self.records.push(PendingPaint {
+            font: outline.paint_font.clone(),
+            glyph_id: glyph_id.map(|id| id.to_u32()),
+            source: outline.paint_source,
+            x_delta: origin_px / metrics.pixels_per_point - glyph.pos.x,
+            y_tweak: metrics.y_offset_in_points,
+            offset: offset_px / metrics.pixels_per_point,
+            scale: vec2(scale, -scale),
+            outline_bounds: outline.outline_bounds,
+        });
+    }
+
+    fn raster(&mut self, glyph: &mut Glyph) {
+        glyph.paint_index =
+            u32::try_from(self.records.len()).expect("too many glyph paint records");
+        self.records.push(PendingPaint {
+            font: None,
+            glyph_id: None,
+            source: super::GlyphPaintSource::CustomRasterizer,
+            x_delta: 0.0,
+            y_tweak: 0.0,
+            offset: Vec2::ZERO,
+            scale: Vec2::ZERO,
+            outline_bounds: Rect::NOTHING,
+        });
+    }
+
+    fn finish_row(&self, point_scale: PointScale, job: &LayoutJob, row: &mut Row) {
+        row.glyph_paint = row
+            .glyphs
+            .iter()
+            .enumerate()
+            .filter_map(|(glyph_index, glyph)| {
+                let pending = self.records.get(glyph.paint_index as usize)?;
+                let format = &job.sections[glyph.section_index as usize].format;
+                let mut paint = super::GlyphPaint {
+                    glyph_index,
+                    font: pending.font.clone(),
+                    glyph_id: pending.glyph_id,
+                    source: pending.source,
+                    origin: glyph.pos + vec2(pending.x_delta, pending.y_tweak),
+                    offset: pending.offset,
+                    outline_scale: pending.scale,
+                    shear: 0.0,
+                    shear_origin_y: 0.0,
+                    color: format.color,
+                    is_color: glyph.is_color
+                        || pending.source == super::GlyphPaintSource::FontColor,
+                    bounds: Rect::NOTHING,
+                };
+                if pending.source == super::GlyphPaintSource::Outline {
+                    for corner in [
+                        pending.outline_bounds.left_top(),
+                        pending.outline_bounds.right_top(),
+                        pending.outline_bounds.left_bottom(),
+                        pending.outline_bounds.right_bottom(),
+                    ] {
+                        paint
+                            .bounds
+                            .extend_with(paint.local_point(corner.to_vec2()));
+                    }
+                } else if !glyph.uv_rect.is_nothing() {
+                    let top_left = glyph.pos + glyph.uv_rect.offset;
+                    let top_left = pos2(
+                        point_scale.round_to_pixel(top_left.x),
+                        point_scale.round_to_pixel(top_left.y),
+                    );
+                    paint.bounds = Rect::from_min_size(top_left, glyph.uv_rect.size);
+                }
+                if format.italics && paint.bounds.is_positive() {
+                    paint.shear = 0.25;
+                    // Match the stock bitmap shear pivot while bitmap preparation is enabled.
+                    paint.shear_origin_y = if glyph.uv_rect.is_nothing() {
+                        paint.bounds.max.y
+                    } else {
+                        point_scale.round_to_pixel(glyph.pos.y + glyph.uv_rect.offset.y)
+                            + glyph.uv_rect.size.y
+                    };
+                    let bounds = paint.bounds;
+                    paint.bounds = Rect::NOTHING;
+                    for mut corner in [
+                        bounds.left_top(),
+                        bounds.right_top(),
+                        bounds.left_bottom(),
+                        bounds.right_bottom(),
+                    ] {
+                        corner.x += paint.shear * (paint.shear_origin_y - corner.y);
+                        paint.bounds.extend_with(corner);
+                    }
+                }
+                Some(paint)
+            })
+            .collect();
+    }
+}
+
 /// Temporary storage before line-wrapping.
 #[derive(Clone)]
 struct Paragraph {
@@ -109,6 +241,7 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
 
     // For most of this we ignore the y coordinate:
 
+    let mut paint = PaintLayout::default();
     let mut paragraphs = vec![Paragraph::from_section_index(0)];
     {
         let mut shape_buffer = fonts.take_shape_buffer();
@@ -121,6 +254,7 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
                 section_index as u32,
                 section,
                 &mut paragraphs,
+                &mut paint,
             );
         }
         fonts.return_shape_buffer(shape_buffer);
@@ -134,7 +268,13 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
     let mut rows = rows_from_paragraphs(paragraphs, &job, pixels_per_point, &mut elided);
     if elided && let Some(last_placed) = rows.last_mut() {
         let last_row = Arc::make_mut(&mut last_placed.row);
-        replace_last_glyph_with_overflow_character(fonts, pixels_per_point, &job, last_row);
+        replace_last_glyph_with_overflow_character(
+            fonts,
+            pixels_per_point,
+            &job,
+            last_row,
+            &mut paint,
+        );
         if let Some(last) = last_row.glyphs.last() {
             last_row.size.x = last.max_x();
         }
@@ -159,11 +299,12 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
     }
 
     // Calculate the Y positions and tessellate the text:
-    galley_from_rows(point_scale, job, rows, elided, intrinsic_size)
+    galley_from_rows(point_scale, job, rows, elided, intrinsic_size, paint)
 }
 
 /// Shared context for emitting shaped glyphs into a [`Paragraph`].
-struct ShapingContext {
+struct ShapingContext<'a> {
+    _paint: &'a mut PaintLayout,
     /// The family of the section being shaped.
     family: FamilyKey,
     pixels_per_point: f32,
@@ -176,7 +317,7 @@ struct ShapingContext {
     prev_cluster: Option<u32>,
 }
 
-impl ShapingContext {
+impl ShapingContext<'_> {
     fn glyph(
         &self,
         chr: char,
@@ -199,6 +340,8 @@ impl ShapingContext {
             is_color,
             section_index: self.section_index,
             first_vertex: 0,
+            #[cfg(feature = "glyph_paint")]
+            paint_index: u32::MAX,
         }
     }
 }
@@ -232,7 +375,7 @@ fn layout_shaped_run(
     run_text: &str,
     glyph_buffer: &harfrust::GlyphBuffer,
     face_metrics: &StyledMetrics,
-    ctx: &mut ShapingContext,
+    ctx: &mut ShapingContext<'_>,
     paragraph: &mut Paragraph,
 ) {
     let px_scale = face_metrics.px_scale_factor;
@@ -347,9 +490,7 @@ fn layout_shaped_run(
                 }
                 let advance_width_px =
                     glyph_info.advance_width_unscaled.0 * fallback_metrics.px_scale_factor;
-                let OutlineGlyph {
-                    allocation, x_px, ..
-                } = allocate_glyph_info(
+                let outline = allocate_glyph_info(
                     fonts,
                     fallback_key,
                     &fallback_metrics,
@@ -358,16 +499,28 @@ fn layout_shaped_run(
                     chr,
                 );
 
+                #[cfg_attr(not(feature = "glyph_paint"), allow(unused_mut))]
+                let mut glyph = ctx.glyph(
+                    chr,
+                    outline.x_px,
+                    advance_width_px,
+                    &fallback_metrics,
+                    outline.allocation,
+                );
+                #[cfg(feature = "glyph_paint")]
+                ctx._paint.outline(
+                    &mut glyph,
+                    &outline,
+                    glyph_info.id,
+                    &fallback_metrics,
+                    paragraph.cursor_x_px,
+                    Vec2::ZERO,
+                );
                 paragraph.cursor_x_px += advance_width_px;
-
-                ctx.glyph(chr, x_px, advance_width_px, &fallback_metrics, allocation)
+                glyph
             }
         } else {
-            let OutlineGlyph {
-                allocation: mut glyph_alloc,
-                x_px,
-                ..
-            } = fonts.allocate_glyph(
+            let outline = fonts.allocate_glyph(
                 run.font_key,
                 face_metrics,
                 &ShapedGlyph {
@@ -379,11 +532,28 @@ fn layout_shaped_run(
 
             // Apply shaper y_offset — this varies per glyph instance so it
             // is not part of the cached ShapedGlyph / GlyphAllocation.
+            let mut glyph_alloc = outline.allocation;
             glyph_alloc.uv_rect.offset.y += y_offset_px / ctx.pixels_per_point;
 
+            #[cfg_attr(not(feature = "glyph_paint"), allow(unused_mut))]
+            let mut glyph = ctx.glyph(
+                chr,
+                outline.x_px,
+                advance_width_px,
+                face_metrics,
+                glyph_alloc,
+            );
+            #[cfg(feature = "glyph_paint")]
+            ctx._paint.outline(
+                &mut glyph,
+                &outline,
+                Some(glyph_id),
+                face_metrics,
+                paragraph.cursor_x_px,
+                vec2(x_offset_px, y_offset_px),
+            );
             paragraph.cursor_x_px += advance_width_px;
-
-            ctx.glyph(chr, x_px, advance_width_px, face_metrics, glyph_alloc)
+            glyph
         };
         paragraph.glyphs.push(glyph);
         cluster_glyph_count += 1;
@@ -417,6 +587,7 @@ fn allocate_glyph_info(
             x_px: h_pos_px.round() as i32,
             #[cfg(feature = "glyph_paint")]
             paint_font: None,
+            ..Default::default()
         };
     };
     fonts.allocate_glyph(
@@ -432,7 +603,7 @@ fn allocate_glyph_info(
 
 /// Emit one glyph for a rasterized cluster and advance the cursor.
 fn raster_glyph(
-    ctx: &ShapingContext,
+    ctx: &mut ShapingContext<'_>,
     paragraph: &mut Paragraph,
     chr: char,
     raster: &RasterGlyphAllocation,
@@ -440,13 +611,17 @@ fn raster_glyph(
 ) -> Glyph {
     let physical_x = paragraph.cursor_x_px.round() as i32;
     paragraph.cursor_x_px += raster.advance_px;
-    ctx.glyph(
+    #[cfg_attr(not(feature = "glyph_paint"), allow(unused_mut))]
+    let mut glyph = ctx.glyph(
         chr,
         physical_x,
         raster.advance_px,
         face_metrics,
         raster.allocation,
-    )
+    );
+    #[cfg(feature = "glyph_paint")]
+    ctx._paint.raster(&mut glyph);
+    glyph
 }
 
 /// Emit the glyphs of a run that a [`GlyphRasterizer`](crate::text::GlyphRasterizer) rendered,
@@ -455,7 +630,7 @@ fn raster_glyph(
 /// The run is one grapheme cluster: its first char gets the bitmap,
 /// and the rest zero-width continuation glyphs.
 fn layout_raster_run(
-    ctx: &mut ShapingContext,
+    ctx: &mut ShapingContext<'_>,
     paragraph: &mut Paragraph,
     run_text: &str,
     raster: &RasterGlyphAllocation,
@@ -488,7 +663,7 @@ fn layout_raster_run(
 /// and text-selection code depends on. Continuation glyphs have
 /// [`GlyphAllocation::default()`] so [`tessellate_glyphs`] skips them entirely.
 fn emit_continuation_glyphs(
-    ctx: &ShapingContext,
+    ctx: &ShapingContext<'_>,
     paragraph: &mut Paragraph,
     run_text: &str,
     cluster_bytes: Range<usize>,
@@ -526,6 +701,7 @@ fn layout_section(
     section_index: u32,
     section: &LayoutSection,
     out_paragraphs: &mut Vec<Paragraph>,
+    paint: &mut PaintLayout,
 ) -> harfrust::UnicodeBuffer {
     let LayoutSection {
         leading_space,
@@ -550,6 +726,7 @@ fn layout_section(
 
     let section_text = &job.text[byte_range.as_usize()];
     let mut ctx = ShapingContext {
+        _paint: paint,
         family,
         pixels_per_point,
         font_size,
@@ -709,6 +886,8 @@ fn rows_from_paragraphs(
                     section_index_at_start: paragraph.section_index_at_start,
                     glyphs: vec![],
                     visuals: Default::default(),
+                    #[cfg(feature = "glyph_paint")]
+                    glyph_paint: Default::default(),
                     size: vec2(0.0, paragraph.empty_paragraph_height),
                 }),
                 ends_with_newline: !is_last_paragraph,
@@ -726,6 +905,8 @@ fn rows_from_paragraphs(
                         section_index_at_start: paragraph.section_index_at_start,
                         glyphs: paragraph.glyphs,
                         visuals: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
+                        glyph_paint: Default::default(),
                         size: vec2(paragraph_width, 0.0),
                     }),
                     ends_with_newline: !is_last_paragraph,
@@ -778,6 +959,8 @@ fn line_break(
                         section_index_at_start: paragraph.section_index_at_start,
                         glyphs: vec![],
                         visuals: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
+                        glyph_paint: Default::default(),
                         size: Vec2::ZERO,
                     }),
                     ends_with_newline: false,
@@ -804,6 +987,8 @@ fn line_break(
                         section_index_at_start,
                         glyphs,
                         visuals: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
+                        glyph_paint: Default::default(),
                         size: vec2(paragraph_max_x, 0.0),
                     }),
                     ends_with_newline: false,
@@ -847,6 +1032,8 @@ fn line_break(
                     section_index_at_start,
                     glyphs,
                     visuals: Default::default(),
+                    #[cfg(feature = "glyph_paint")]
+                    glyph_paint: Default::default(),
                     size: vec2(paragraph_max_x - paragraph_min_x, 0.0),
                 }),
                 ends_with_newline: false,
@@ -863,6 +1050,7 @@ fn replace_last_glyph_with_overflow_character(
     pixels_per_point: f32,
     job: &LayoutJob,
     row: &mut Row,
+    _paint: &mut PaintLayout,
 ) {
     let Some(overflow_character) = job.wrap.overflow_character else {
         return;
@@ -928,16 +1116,13 @@ fn replace_last_glyph_with_overflow_character(
         {
             // we are done
 
-            let OutlineGlyph {
-                allocation: replacement_glyph_alloc,
-                x_px,
-                ..
-            } = match &raster {
+            let outline = match &raster {
                 Some(raster) => OutlineGlyph {
                     allocation: raster.allocation,
                     #[cfg(feature = "glyph_paint")]
                     paint_font: None,
                     x_px: (overflow_glyph_x * pixels_per_point).round() as i32,
+                    ..Default::default()
                 },
                 None => allocate_glyph_info(
                     fonts,
@@ -954,20 +1139,37 @@ fn replace_last_glyph_with_overflow_character(
                 .line_height
                 .unwrap_or(font_metrics.row_height);
 
-            row.glyphs.push(Glyph {
+            #[cfg_attr(not(feature = "glyph_paint"), allow(unused_mut))]
+            let mut glyph = Glyph {
                 chr: overflow_character,
-                pos: pos2(x_px as f32 / pixels_per_point, f32::NAN),
+                pos: pos2(outline.x_px as f32 / pixels_per_point, f32::NAN),
                 advance_width: advance_width_px / pixels_per_point,
                 line_height,
                 font_face_height: font_face_metrics.row_height,
                 font_face_ascent: font_face_metrics.ascent,
                 font_height: font_metrics.row_height,
                 font_ascent: font_metrics.ascent,
-                uv_rect: replacement_glyph_alloc.uv_rect,
-                is_color: replacement_glyph_alloc.is_color,
+                uv_rect: outline.allocation.uv_rect,
+                is_color: outline.allocation.is_color,
                 section_index,
                 first_vertex: 0, // filled in later
-            });
+                #[cfg(feature = "glyph_paint")]
+                paint_index: u32::MAX,
+            };
+            #[cfg(feature = "glyph_paint")]
+            if raster.is_some() {
+                _paint.raster(&mut glyph);
+            } else {
+                _paint.outline(
+                    &mut glyph,
+                    &outline,
+                    glyph_info.id,
+                    &font_face_metrics,
+                    overflow_glyph_x * pixels_per_point,
+                    Vec2::ZERO,
+                );
+            }
+            row.glyphs.push(glyph);
             return;
         }
 
@@ -1087,6 +1289,7 @@ fn galley_from_rows(
     mut rows: Vec<PlacedRow>,
     elided: bool,
     intrinsic_size: Vec2,
+    _paint: PaintLayout,
 ) -> Galley {
     let mut first_row_min_height = job.first_row_min_height;
     let mut cursor_y = 0.0;
@@ -1147,8 +1350,15 @@ fn galley_from_rows(
         num_vertices += row.visuals.mesh.vertices.len();
         num_indices += row.visuals.mesh.indices.len();
 
+        #[cfg(feature = "glyph_paint")]
+        _paint.finish_row(point_scale, &job, row);
+
         row.section_index_at_start = u32::MAX; // No longer in use.
         for glyph in &mut row.glyphs {
+            #[cfg(feature = "glyph_paint")]
+            {
+                glyph.paint_index = u32::MAX;
+            }
             glyph.section_index = u32::MAX; // No longer in use.
         }
     }
@@ -1511,7 +1721,7 @@ impl RowBreakCandidates {
 /// the caller to reuse the allocation across calls.
 fn segment_into_runs(
     fonts: &mut FontsImpl,
-    ctx: &ShapingContext,
+    ctx: &ShapingContext<'_>,
     text: &str,
     out: &mut Vec<TextRun>,
 ) {

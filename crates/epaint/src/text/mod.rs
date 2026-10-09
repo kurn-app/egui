@@ -14,6 +14,8 @@ mod font_tweak;
 mod fonts;
 mod galley_cache;
 mod glyph_atlas;
+#[cfg(feature = "glyph_paint")]
+mod glyph_paint;
 mod glyph_rasterizer;
 mod index;
 mod styled_metrics;
@@ -81,6 +83,9 @@ impl Default for TextOptions {
         }
     }
 }
+
+#[cfg(feature = "glyph_paint")]
+pub use glyph_paint::{GlyphPaint, GlyphPaintSource};
 
 #[cfg(feature = "glyph_paint")]
 pub use font_paint::{

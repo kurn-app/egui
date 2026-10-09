@@ -855,6 +855,12 @@ pub struct Row {
 
     /// The mesh, ready to be rendered.
     pub visuals: RowVisuals,
+
+    /// Shared resolved paint occurrences in original row coordinates.
+    /// Not serialized: deserialized galleys use the stock bitmap rendering path.
+    #[cfg(feature = "glyph_paint")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub glyph_paint: Arc<[super::GlyphPaint]>,
 }
 
 /// The tessellated output of a row.
@@ -938,6 +944,11 @@ pub struct Glyph {
 
     /// Which is our first vertex in [`RowVisuals::mesh`].
     pub first_vertex: u32,
+
+    /// Temporary index into layout's paint arena; invalidated before caching.
+    #[cfg(feature = "glyph_paint")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) paint_index: u32,
 }
 
 impl Glyph {

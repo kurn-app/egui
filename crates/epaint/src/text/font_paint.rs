@@ -125,6 +125,16 @@ impl FontPaintInstance {
             .units_per_em
     }
 
+    pub(crate) fn outline_bounds(&self, glyph_id: u32) -> (super::GlyphPaintSource, emath::Rect) {
+        use super::GlyphPaintSource;
+        let mut pen = BoundsPen::default();
+        match self.draw_unhinted(glyph_id, &mut pen) {
+            Ok(true) if pen.has_segments => (GlyphPaintSource::Outline, pen.bounds),
+            Ok(true) => (GlyphPaintSource::Empty, emath::Rect::NOTHING),
+            Ok(false) | Err(_) => (GlyphPaintSource::Unsupported, emath::Rect::NOTHING),
+        }
+    }
+
     /// Emit an unhinted path for a resolved glyph in design units, with Y pointing up.
     ///
     /// There is no size, subpixel translation, synthetic italic shear, or font
@@ -150,6 +160,48 @@ impl FontPaintInstance {
         )?;
         Ok(true)
     }
+}
+
+struct BoundsPen {
+    bounds: emath::Rect,
+    has_segments: bool,
+}
+
+impl Default for BoundsPen {
+    fn default() -> Self {
+        Self {
+            bounds: emath::Rect::NOTHING,
+            has_segments: false,
+        }
+    }
+}
+
+impl BoundsPen {
+    fn include(&mut self, x: f32, y: f32) {
+        self.bounds.extend_with(emath::pos2(x, y));
+    }
+}
+
+impl OutlinePen for BoundsPen {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.include(x, y);
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.has_segments = true;
+        self.include(x, y);
+    }
+    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        self.has_segments = true;
+        self.include(cx, cy);
+        self.include(x, y);
+    }
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        self.has_segments = true;
+        self.include(cx0, cy0);
+        self.include(cx1, cy1);
+        self.include(x, y);
+    }
+    fn close(&mut self) {}
 }
 
 #[cfg(all(test, feature = "default_fonts"))]

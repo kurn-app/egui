@@ -93,6 +93,8 @@ pub fn adjust_colors(
             override_text_color,
             opacity_factor: _,
             angle: _,
+            #[cfg(feature = "glyph_paint")]
+                glyph_paint_scale: _,
         }) => {
             adjust_color(&mut underline.color);
             adjust_color(fallback_color);
@@ -104,6 +106,10 @@ pub fn adjust_colors(
                 let galley = Arc::make_mut(galley);
                 for placed_row in &mut galley.rows {
                     let row = Arc::make_mut(&mut placed_row.row);
+                    #[cfg(feature = "glyph_paint")]
+                    for paint in Arc::make_mut(&mut row.glyph_paint) {
+                        adjust_color(&mut paint.color);
+                    }
                     for vertex in &mut row.visuals.mesh.vertices {
                         adjust_color(&mut vertex.color);
                     }

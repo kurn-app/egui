@@ -51,12 +51,19 @@ pub struct GlyphAllocation {
 }
 
 /// An outline glyph in the atlas, positioned for one [`ShapedGlyph`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(feature = "glyph_paint"), derive(Copy))]
 pub(crate) struct OutlineGlyph {
     /// Resolved source, retained independently of bitmap atlas allocation.
     #[cfg(feature = "glyph_paint")]
     pub paint_font: Option<std::sync::Arc<crate::text::FontPaintInstance>>,
+
+    #[cfg(feature = "glyph_paint")]
+    pub paint_source: crate::text::GlyphPaintSource,
+
+    /// Unhinted conservative control bounds in design units, Y up.
+    #[cfg(feature = "glyph_paint")]
+    pub outline_bounds: emath::Rect,
 
     pub allocation: GlyphAllocation,
 
@@ -66,6 +73,21 @@ pub(crate) struct OutlineGlyph {
     /// the bitmap was rendered for. Draw the bitmap here, not at the
     /// un-rounded `h_pos`, or it will be blurry.
     pub x_px: i32,
+}
+
+impl Default for OutlineGlyph {
+    fn default() -> Self {
+        Self {
+            allocation: GlyphAllocation::default(),
+            x_px: 0,
+            #[cfg(feature = "glyph_paint")]
+            paint_font: None,
+            #[cfg(feature = "glyph_paint")]
+            paint_source: crate::text::GlyphPaintSource::Unsupported,
+            #[cfg(feature = "glyph_paint")]
+            outline_bounds: emath::Rect::NOTHING,
+        }
+    }
 }
 
 /// A glyph from a [`GlyphRasterizer`], allocated in the atlas.
@@ -213,7 +235,7 @@ pub(crate) struct GlyphAtlas {
     atlas: TextureAtlas,
 
     /// Glyphs rendered from font outlines.
-    outline_glyphs: IntMap<OutlineGlyphKey, GlyphAllocation>,
+    outline_glyphs: IntMap<OutlineGlyphKey, OutlineGlyph>,
 
     /// Glyphs from the [`GlyphRasterizer`]s.
     ///
@@ -306,8 +328,11 @@ impl GlyphAtlas {
             outline_glyphs,
             ..
         } = self;
-        let allocation = *outline_glyphs.entry(key).or_insert_with(|| {
-            face.rasterize_glyph(metrics, glyph_id, bin)
+        let cached = outline_glyphs.entry(key).or_insert_with(|| {
+            let bitmap = face.rasterize_glyph(metrics, glyph_id, bin);
+            #[cfg(feature = "glyph_paint")]
+            let painted_color = bitmap.as_ref().is_some_and(|bitmap| bitmap.is_color);
+            let allocation = bitmap
                 .and_then(|bitmap| {
                     let transfer = Self::transfer_function(atlas, bitmap.is_color);
                     let mut uv_rect =
@@ -318,14 +343,34 @@ impl GlyphAtlas {
                         is_color: bitmap.is_color,
                     })
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+
+            #[cfg(feature = "glyph_paint")]
+            let paint_font = face.paint_instance(metrics);
+            #[cfg(feature = "glyph_paint")]
+            let (paint_source, outline_bounds) = if painted_color {
+                (
+                    crate::text::GlyphPaintSource::FontColor,
+                    emath::Rect::NOTHING,
+                )
+            } else {
+                paint_font.outline_bounds(glyph_id.to_u32())
+            };
+            OutlineGlyph {
+                allocation,
+                x_px: 0,
+                #[cfg(feature = "glyph_paint")]
+                paint_font: Some(paint_font),
+                #[cfg(feature = "glyph_paint")]
+                paint_source,
+                #[cfg(feature = "glyph_paint")]
+                outline_bounds,
+            }
         });
 
         OutlineGlyph {
-            allocation,
             x_px,
-            #[cfg(feature = "glyph_paint")]
-            paint_font: Some(face.paint_instance(metrics)),
+            ..cached.clone()
         }
     }
 
