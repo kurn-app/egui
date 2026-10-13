@@ -861,6 +861,13 @@ pub struct Row {
     #[cfg(feature = "glyph_paint")]
     #[cfg_attr(feature = "serde", serde(skip))]
     pub glyph_paint: Arc<[super::GlyphPaint]>,
+
+    /// [`Row::check_glyph_paint`] as layout computed it. Code that edits the
+    /// row's glyphs, paint or mesh structure after layout recomputes it.
+    /// Not serialized: a deserialized row is unchecked.
+    #[cfg(feature = "glyph_paint")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub glyph_paint_check: super::GlyphPaintCheck,
 }
 
 /// The tessellated output of a row.

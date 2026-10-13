@@ -200,6 +200,8 @@ impl TextShape {
                 glyphs: _, // TODO(emilk): would it make sense to transform these?
                 #[cfg(feature = "glyph_paint")]
                     glyph_paint: _,
+                #[cfg(feature = "glyph_paint")]
+                    glyph_paint_check: _,
                 size,
                 visuals,
             } = Arc::make_mut(row);

@@ -21,6 +21,70 @@ pub enum GlyphPaintSource {
     Unsupported,
 }
 
+/// How a row's glyph paint relates to its stock mesh. Layout checks it once per
+/// row, so a painter replacing glyph quads need not re-walk the row every frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GlyphPaintCheck {
+    /// Never checked, as for a deserialized row. Paint it with the stock mesh.
+    #[default]
+    Unchecked,
+    /// Paint occurrences are in strictly increasing glyph order with finite or
+    /// [`Rect::NOTHING`] bounds, each glyph with a stock quad has one, and the
+    /// mesh holds only those quads: four vertices and six indices each, in
+    /// glyph order. A painter may draw any occurrence itself and keep the
+    /// others' stock quads.
+    Separable,
+    /// The mesh also paints backgrounds or decorations around the glyph quads.
+    Decorated,
+    /// The paint occurrences or the mesh layout do not match the glyphs.
+    Malformed,
+}
+
+impl super::Row {
+    /// Check the row's glyph paint against its glyphs and stock mesh. Layout
+    /// stores the result in [`super::Row::glyph_paint_check`]; code that edits
+    /// a row's glyphs, paint or mesh structure afterwards recomputes it.
+    pub fn check_glyph_paint(&self) -> GlyphPaintCheck {
+        let mesh = &self.visuals.mesh;
+        if self.visuals.glyph_vertex_range != (0..mesh.vertices.len()) {
+            return GlyphPaintCheck::Decorated;
+        }
+        let mut previous = None;
+        for paint in self.glyph_paint.iter() {
+            if paint.glyph_index >= self.glyphs.len()
+                || previous.is_some_and(|p| p >= paint.glyph_index)
+                || (paint.bounds != Rect::NOTHING && !paint.bounds.is_finite())
+            {
+                return GlyphPaintCheck::Malformed;
+            }
+            previous = Some(paint.glyph_index);
+        }
+        let mut paints = self.glyph_paint.iter().peekable();
+        let (mut vertex, mut index) = (0, 0);
+        for (glyph_index, glyph) in self.glyphs.iter().enumerate() {
+            if glyph.uv_rect.is_nothing() {
+                continue;
+            }
+            while paints.next_if(|p| p.glyph_index < glyph_index).is_some() {}
+            let owned = paints.peek().is_some_and(|p| p.glyph_index == glyph_index);
+            let quad = vertex..vertex + 4;
+            let indices = mesh.indices.get(index..index + 6);
+            if !owned
+                || glyph.first_vertex as usize != vertex
+                || !indices.is_some_and(|i| i.iter().all(|&i| quad.contains(&(i as usize))))
+            {
+                return GlyphPaintCheck::Malformed;
+            }
+            vertex += 4;
+            index += 6;
+        }
+        if vertex != mesh.vertices.len() || index != mesh.indices.len() {
+            return GlyphPaintCheck::Malformed;
+        }
+        GlyphPaintCheck::Separable
+    }
+}
+
 /// One resolved paint occurrence, separate from character/cursor records.
 ///
 /// Coordinates are relative to the original, untransformed row. The row's current
@@ -107,6 +171,60 @@ mod tests {
 
     fn close(a: Pos2, b: Pos2) {
         assert!((a - b).length() < 1e-4, "{a:?} != {b:?}");
+    }
+
+    #[test]
+    fn layout_checks_row_glyph_paint_against_glyphs_and_mesh() {
+        let mut fonts = ubuntu(FontTweak::default());
+        let galley = layout(&mut fonts, 1.0, Arc::new(job("Ab c")));
+        let row = &galley.rows[0].row;
+        assert_eq!(row.glyph_paint_check, GlyphPaintCheck::Separable);
+        assert_eq!(row.check_glyph_paint(), GlyphPaintCheck::Separable);
+
+        let mut underlined = job("Ab");
+        underlined.sections[0].format.underline = crate::Stroke::new(1.0, Color32::RED);
+        let decorated = layout(&mut fonts, 1.0, Arc::new(underlined));
+        assert_eq!(
+            decorated.rows[0].glyph_paint_check,
+            GlyphPaintCheck::Decorated
+        );
+
+        let malformed = |edit: &dyn Fn(&mut super::super::Row)| {
+            let mut row = (**row).clone();
+            edit(&mut row);
+            row.check_glyph_paint()
+        };
+        let with_paints = |row: &mut super::super::Row, edit: &dyn Fn(&mut Vec<GlyphPaint>)| {
+            let mut paints = row.glyph_paint.to_vec();
+            edit(&mut paints);
+            row.glyph_paint = paints.into();
+        };
+        // Paint occurrences out of glyph order.
+        assert_eq!(
+            malformed(&|row| with_paints(row, &|p| p.swap(0, 1))),
+            GlyphPaintCheck::Malformed
+        );
+        // A stock quad without its paint occurrence.
+        assert_eq!(
+            malformed(&|row| with_paints(row, &|p| {
+                p.remove(0);
+            })),
+            GlyphPaintCheck::Malformed
+        );
+        // Non-finite paint bounds.
+        assert_eq!(
+            malformed(&|row| with_paints(row, &|p| {
+                p[0].bounds = Rect::from_min_max(pos2(0.0, 0.0), pos2(f32::INFINITY, 1.0));
+            })),
+            GlyphPaintCheck::Malformed
+        );
+        // A triangle reaching into the next glyph's quad.
+        assert_eq!(
+            malformed(&|row| row.visuals.mesh.indices[0] = 4),
+            GlyphPaintCheck::Malformed
+        );
+        // Unserialized rows are never checked.
+        assert_eq!(GlyphPaintCheck::default(), GlyphPaintCheck::Unchecked);
     }
 
     #[test]

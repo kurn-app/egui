@@ -894,6 +894,8 @@ fn rows_from_paragraphs(
                     visuals: Default::default(),
                     #[cfg(feature = "glyph_paint")]
                     glyph_paint: Default::default(),
+                    #[cfg(feature = "glyph_paint")]
+                    glyph_paint_check: Default::default(),
                     size: vec2(0.0, paragraph.empty_paragraph_height),
                 }),
                 ends_with_newline: !is_last_paragraph,
@@ -913,6 +915,8 @@ fn rows_from_paragraphs(
                         visuals: Default::default(),
                         #[cfg(feature = "glyph_paint")]
                         glyph_paint: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
+                        glyph_paint_check: Default::default(),
                         size: vec2(paragraph_width, 0.0),
                     }),
                     ends_with_newline: !is_last_paragraph,
@@ -967,6 +971,8 @@ fn line_break(
                         visuals: Default::default(),
                         #[cfg(feature = "glyph_paint")]
                         glyph_paint: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
+                        glyph_paint_check: Default::default(),
                         size: Vec2::ZERO,
                     }),
                     ends_with_newline: false,
@@ -995,6 +1001,8 @@ fn line_break(
                         visuals: Default::default(),
                         #[cfg(feature = "glyph_paint")]
                         glyph_paint: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
+                        glyph_paint_check: Default::default(),
                         size: vec2(paragraph_max_x, 0.0),
                     }),
                     ends_with_newline: false,
@@ -1040,6 +1048,8 @@ fn line_break(
                     visuals: Default::default(),
                     #[cfg(feature = "glyph_paint")]
                     glyph_paint: Default::default(),
+                    #[cfg(feature = "glyph_paint")]
+                    glyph_paint_check: Default::default(),
                     size: vec2(paragraph_max_x - paragraph_min_x, 0.0),
                 }),
                 ends_with_newline: false,
@@ -1354,7 +1364,10 @@ fn galley_from_rows(
         num_indices += row.visuals.mesh.indices.len();
 
         #[cfg(feature = "glyph_paint")]
-        _paint.finish_row(point_scale, &job, row);
+        {
+            _paint.finish_row(point_scale, &job, row);
+            row.glyph_paint_check = row.check_glyph_paint();
+        }
 
         row.section_index_at_start = u32::MAX; // No longer in use.
         for glyph in &mut row.glyphs {
