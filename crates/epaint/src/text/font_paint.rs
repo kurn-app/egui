@@ -1,8 +1,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use self_cell::self_cell;
-use skrifa::{FontRef, GlyphId, MetadataProvider as _, instance::Size, outline::DrawSettings};
+use skrifa::{GlyphId, MetadataProvider as _, instance::Size, outline::DrawSettings};
 
 use super::Blob;
 
@@ -25,20 +24,34 @@ impl FontInstanceId {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
         Self(
             NEXT_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("font instance identity space exhausted"),
         )
     }
 }
 
-self_cell! {
-    struct PaintFontCell {
-        owner: Blob,
+mod cell {
+    #![expect(
+        clippy::mem_forget,
+        reason = "`self_cell!` expands to a `mem::forget` of its owner guard"
+    )]
 
-        #[covariant]
-        dependent: FontRef,
+    use self_cell::self_cell;
+    use skrifa::FontRef;
+
+    use super::Blob;
+
+    self_cell! {
+        pub(super) struct PaintFontCell {
+            owner: Blob,
+
+            #[covariant]
+            dependent: FontRef,
+        }
     }
 }
+
+use cell::PaintFontCell;
 
 /// Shared font bytes and immutable parsed views, independent of bitmap hinting state.
 pub(super) struct PaintFontData {
@@ -67,6 +80,11 @@ pub struct FontPaintInstance {
     id: FontInstanceId,
     data: Arc<PaintFontData>,
     location: skrifa::instance::Location,
+    /// Outline bounds by glyph ID, shared by every size and subpixel bin of this instance.
+    bounds: crate::mutex::Mutex<nohash_hasher::IntMap<u32, (super::GlyphPaintSource, emath::Rect)>>,
+    /// Number of outlines drawn to compute bounds.
+    #[cfg(test)]
+    bounds_draws: AtomicUsize,
 }
 
 impl core::fmt::Debug for FontPaintInstance {
@@ -93,6 +111,9 @@ impl FontPaintInstance {
             id: FontInstanceId::new(),
             data,
             location,
+            bounds: Default::default(),
+            #[cfg(test)]
+            bounds_draws: AtomicUsize::new(0),
         }
     }
 
@@ -125,14 +146,28 @@ impl FontPaintInstance {
             .units_per_em
     }
 
+    /// Paint source and conservative design-unit bounds of a glyph's outline, drawn once per
+    /// glyph ID and remembered for the life of the instance.
     pub(crate) fn outline_bounds(&self, glyph_id: u32) -> (super::GlyphPaintSource, emath::Rect) {
         use super::GlyphPaintSource;
+        if let Some(bounds) = self.bounds.lock().get(&glyph_id) {
+            return *bounds;
+        }
+        #[cfg(test)]
+        self.bounds_draws.fetch_add(1, Ordering::Relaxed);
         let mut pen = BoundsPen::default();
-        match self.draw_unhinted(glyph_id, &mut pen) {
+        let bounds = match self.draw_unhinted(glyph_id, &mut pen) {
             Ok(true) if pen.has_segments => (GlyphPaintSource::Outline, pen.bounds),
             Ok(true) => (GlyphPaintSource::Empty, emath::Rect::NOTHING),
             Ok(false) | Err(_) => (GlyphPaintSource::Unsupported, emath::Rect::NOTHING),
-        }
+        };
+        self.bounds.lock().insert(glyph_id, bounds);
+        bounds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outline_bounds_draws(&self) -> usize {
+        self.bounds_draws.load(Ordering::Relaxed)
     }
 
     /// Emit an unhinted path for a resolved glyph in design units, with Y pointing up.
@@ -143,7 +178,11 @@ impl FontPaintInstance {
     /// to convert using its own encoding policy.
     ///
     /// Returns `Ok(false)` if the face has no outline for this ID. `Ok(true)`
-    /// can emit no commands for an empty outline such as a space. An error may
+    /// can emit no commands for an empty outline such as a space.
+    ///
+    /// # Errors
+    ///
+    /// Returns the outline's draw error, such as malformed glyph data. An error may
     /// follow partial pen output: discard that output and use fallback.
     pub fn draw_unhinted(
         &self,
@@ -239,7 +278,7 @@ mod tests {
             data.index,
             data.tweak.clone(),
         )
-        .unwrap()
+        .expect("bundled fixture font parses")
     }
 
     fn glyphs(face: &FontFace, text: &str) -> Vec<u32> {

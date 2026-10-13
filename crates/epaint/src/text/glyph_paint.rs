@@ -43,7 +43,7 @@ pub struct GlyphPaint {
     pub offset: Vec2,
     /// Design-unit to UI-point scale, including font tweaks and Y-up to Y-down conversion.
     pub outline_scale: Vec2,
-    /// Synthetic italic shear: x += shear * (shear_origin_y - y).
+    /// Synthetic italic shear: `x += shear * (shear_origin_y - y)`.
     pub shear: f32,
     /// Row-local pivot for synthetic italic shear.
     pub shear_origin_y: f32,
@@ -71,7 +71,10 @@ mod tests {
     use crate::text::{
         FontData, FontDefinitions, FontFamily, FontId, FontPriority, FontTweak, GlyphBitmap,
         GlyphRasterizer, GlyphRasterizerRequest, LayoutJob, RasterizedGlyph, TextOptions,
-        VariationCoords, fonts::FontsImpl, galley_cache::GalleyCache, text_layout::layout,
+        VariationCoords,
+        fonts::FontsImpl,
+        galley_cache::GalleyCache,
+        text_layout::{ITALIC_SHEAR, layout},
     };
     use crate::{Mesh, Shape, Tessellator, TextShape};
     use emath::{Rot2, TSTransform, pos2, vec2};
@@ -326,7 +329,7 @@ mod tests {
                     galley.rows[0].glyph_paint[1].source,
                     GlyphPaintSource::Outline
                 );
-                let mut shape = TextShape::new(Pos2::ZERO, galley.clone(), Color32::GREEN)
+                let mut shape = TextShape::new(Pos2::ZERO, Arc::clone(&galley), Color32::GREEN)
                     .with_opacity_factor(opacity);
                 shape.override_text_color = override_color;
                 let mut mesh = Mesh::default();
@@ -345,13 +348,105 @@ mod tests {
     }
 
     #[test]
+    fn row_paint_italic_bitmap_quad_matches_stock_mesh() {
+        let mut fonts = ubuntu(FontTweak::default()).with_glyph_rasterizer(raster(false));
+        let mut input = job("AB");
+        input.sections[0].format.italics = true;
+        let galley = layout(&mut fonts, 1.0, Arc::new(input));
+        let row = &galley.rows[0];
+        let sources = row
+            .glyph_paint
+            .iter()
+            .map(|paint| paint.source)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            vec![
+                GlyphPaintSource::CustomRasterizer,
+                GlyphPaintSource::Outline
+            ]
+        );
+        let mut checked = 0;
+        for paint in row.glyph_paint.iter() {
+            let glyph = &row.glyphs[paint.glyph_index];
+            if glyph.uv_rect.is_nothing() {
+                continue;
+            }
+            let first = glyph.first_vertex as usize;
+            let quad = &row.visuals.mesh.vertices[first..first + 4];
+            let (top_left, bottom_left) = (quad[0].pos, quad[2].pos);
+            assert_eq!(paint.shear, ITALIC_SHEAR);
+            assert!((paint.shear_origin_y - bottom_left.y).abs() < 1e-4);
+            assert!(
+                (top_left.x - bottom_left.x - paint.shear * (bottom_left.y - top_left.y)).abs()
+                    < 1e-4
+            );
+            if paint.source == GlyphPaintSource::CustomRasterizer {
+                let mesh_bounds =
+                    Rect::from_points(&quad.iter().map(|v| v.pos).collect::<Vec<_>>());
+                close(paint.bounds.min, mesh_bounds.min);
+                close(paint.bounds.max, mesh_bounds.max);
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "both glyphs must have a stock bitmap quad");
+    }
+
+    #[test]
+    fn outline_bounds_drawn_once_per_instance_glyph() {
+        let text = "Hello wall";
+        let sized = |size: f32| {
+            let mut input = job(text);
+            input.sections[0].format.font_id.size = size;
+            Arc::new(input)
+        };
+        let mut fonts = ubuntu(FontTweak::default());
+        let galleys = [12.0, 17.0, 23.0].map(|size| layout(&mut fonts, 1.0, sized(size)));
+        let paints = &galleys[1].rows[0].glyph_paint;
+        let instance = paints[0].font.as_ref().unwrap();
+        for galley in &galleys {
+            assert!(
+                galley.rows[0]
+                    .glyph_paint
+                    .iter()
+                    .all(|paint| { Arc::ptr_eq(instance, paint.font.as_ref().unwrap()) })
+            );
+        }
+        let mut glyph_ids = paints
+            .iter()
+            .map(|paint| paint.glyph_id.unwrap())
+            .collect::<Vec<_>>();
+        glyph_ids.sort_unstable();
+        glyph_ids.dedup();
+        assert!(
+            glyph_ids.len() < paints.len(),
+            "fixture must repeat a glyph"
+        );
+        assert_eq!(instance.outline_bounds_draws(), glyph_ids.len());
+
+        let mut alone = ubuntu(FontTweak::default());
+        let expected = layout(&mut alone, 1.0, sized(17.0));
+        let expected = &expected.rows[0].glyph_paint;
+        assert_eq!(expected.len(), paints.len());
+        for (paint, expected) in paints.iter().zip(expected.iter()) {
+            assert_eq!(paint.glyph_id, expected.glyph_id);
+            assert_eq!(paint.source, expected.source);
+            assert_eq!(paint.bounds, expected.bounds);
+        }
+    }
+
+    #[test]
     fn row_paint_color_adjustment_uses_copy_on_write() {
         let mut fonts = ubuntu(FontTweak::default());
         let galley = Arc::new(layout(&mut fonts, 1.0, Arc::new(job("A"))));
         let records = Arc::clone(&galley.rows[0].glyph_paint);
-        let mut shape = Shape::Text(TextShape::new(Pos2::ZERO, galley.clone(), Color32::WHITE));
+        let mut shape = Shape::Text(TextShape::new(
+            Pos2::ZERO,
+            Arc::clone(&galley),
+            Color32::WHITE,
+        ));
         crate::shape_transform::adjust_colors(&mut shape, |color| {
-            *color = color.gamma_multiply(0.5)
+            *color = color.gamma_multiply(0.5);
         });
         let Shape::Text(shape) = shape else {
             unreachable!()
@@ -365,8 +460,11 @@ mod tests {
 
     #[test]
     fn row_paint_fallback_font_and_missing_outline_remain_explicit() {
+        // The icon is a private-use glyph only the bundled icon face has, so it resolves
+        // through fallback to a second instance under every default font set.
         let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
-        let galley = layout(&mut fonts, 1.0, Arc::new(job("A🎉")));
+        let text = format!("A{}", epaint_default_fonts::special_emojis::GITHUB);
+        let galley = layout(&mut fonts, 1.0, Arc::new(job(&text)));
         let paint = &galley.rows[0].glyph_paint;
         assert_eq!(paint.len(), 2);
         assert_eq!(paint[1].source, GlyphPaintSource::Outline);

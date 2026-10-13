@@ -52,7 +52,7 @@ pub struct GlyphAllocation {
 
 /// An outline glyph in the atlas, positioned for one [`ShapedGlyph`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "glyph_paint"), derive(Copy))]
+#[cfg_attr(not(feature = "glyph_paint"), derive(Copy, Default))]
 pub(crate) struct OutlineGlyph {
     /// Resolved source, retained independently of bitmap atlas allocation.
     #[cfg(feature = "glyph_paint")]
@@ -75,11 +75,13 @@ pub(crate) struct OutlineGlyph {
     pub x_px: i32,
 }
 
-impl Default for OutlineGlyph {
-    fn default() -> Self {
+impl OutlineGlyph {
+    /// A glyph with no resolved font to paint from, such as a custom rasterizer's bitmap
+    /// or a character without a glyph ID.
+    pub fn unpainted(allocation: GlyphAllocation, x_px: i32) -> Self {
         Self {
-            allocation: GlyphAllocation::default(),
-            x_px: 0,
+            allocation,
+            x_px,
             #[cfg(feature = "glyph_paint")]
             paint_font: None,
             #[cfg(feature = "glyph_paint")]
@@ -87,6 +89,13 @@ impl Default for OutlineGlyph {
             #[cfg(feature = "glyph_paint")]
             outline_bounds: emath::Rect::NOTHING,
         }
+    }
+}
+
+#[cfg(feature = "glyph_paint")]
+impl Default for OutlineGlyph {
+    fn default() -> Self {
+        Self::unpainted(GlyphAllocation::default(), 0)
     }
 }
 
@@ -368,10 +377,11 @@ impl GlyphAtlas {
             }
         });
 
-        OutlineGlyph {
-            x_px,
-            ..cached.clone()
-        }
+        #[cfg(not(feature = "glyph_paint"))]
+        let cached = *cached;
+        #[cfg(feature = "glyph_paint")]
+        let cached = cached.clone();
+        OutlineGlyph { x_px, ..cached }
     }
 
     /// Get or rasterize `cluster` using the [`GlyphRasterizer`]s of the given `priority`.
