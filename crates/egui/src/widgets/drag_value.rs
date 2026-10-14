@@ -529,12 +529,15 @@ impl Widget for DragValue<'_> {
 
         let text_style = ui.style().drag_value_text_style.clone();
 
-        if ui.memory(|mem| mem.lost_focus(id)) && !ui.input(|i| i.key_pressed(Key::Escape)) {
+        if ui.memory(|mem| mem.lost_focus(id)) {
+            // Focus reads as lost for two frames, so text abandoned with Escape has to be
+            // dropped on the frame the key arrives, or it would be applied on the next.
+            let abandoned = ui.input(|i| i.key_pressed(Key::Escape));
             let edit_state = ui.data_mut(|data| data.remove_temp::<EditState>(id));
             // Ignore the text if the value was changed by something else while we were editing it,
             // or we would revert that change.
             if let Some(value_text) = edit_state
-                .filter(|edit_state| edit_state.value == old_value)
+                .filter(|edit_state| !abandoned && edit_state.value == old_value)
                 .map(|edit_state| edit_state.text)
             {
                 // We were editing the value as text last frame, but lost focus.

@@ -1020,6 +1020,43 @@ pub fn drag_value_should_not_report_changes_while_typing_without_update_while_ed
     );
 }
 
+/// <kbd>Escape</kbd> abandons the text typed into a `DragValue` that only applies it
+/// once editing is done: the value stays where it was, also on the frames after.
+#[test]
+pub fn drag_value_should_abandon_typed_text_on_escape() {
+    let mut harness = Harness::new_ui_state(
+        |ui, (value, changes): &mut (f64, usize)| {
+            let response = ui
+                .add(egui::DragValue::new(value).update_while_editing(false))
+                .on_hover_text("Value");
+            if response.changed() {
+                *changes += 1;
+            }
+        },
+        (0.0, 0),
+    );
+
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+
+    for character in "42".chars() {
+        harness
+            .get_by_role(accesskit::Role::SpinButton)
+            .type_text(&character.to_string());
+        harness.run();
+    }
+
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    harness.run();
+
+    assert_eq!(
+        harness.state(),
+        &(0.0, 0),
+        "Escape should abandon the typed text"
+    );
+}
+
 /// With the default `update_while_editing(true)` the value, and thus `changed()`,
 /// follows each keystroke.
 #[test]
