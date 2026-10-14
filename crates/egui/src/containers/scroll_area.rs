@@ -558,6 +558,9 @@ impl ScrollArea {
     ///
     /// Positive offset means scrolling down/right.
     ///
+    /// The offset is clamped to this frame's scrollable range once the content is measured.
+    /// It stops any kinetic scrolling on both axes, and is never sprung back as an overscroll.
+    ///
     /// See also: [`Self::vertical_scroll_offset`], [`Self::horizontal_scroll_offset`],
     /// [`Ui::scroll_to_cursor`](crate::ui::Ui::scroll_to_cursor) and
     /// [`Response::scroll_to_me`](crate::Response::scroll_to_me)
@@ -572,6 +575,9 @@ impl ScrollArea {
     ///
     /// Positive offset means scrolling down.
     ///
+    /// The offset is clamped to this frame's scrollable range once the content is measured.
+    /// It stops any kinetic scrolling on that axis, and is never sprung back as an overscroll.
+    ///
     /// See also: [`Self::scroll_offset`], [`Ui::scroll_to_cursor`](crate::ui::Ui::scroll_to_cursor) and
     /// [`Response::scroll_to_me`](crate::Response::scroll_to_me)
     #[inline]
@@ -583,6 +589,9 @@ impl ScrollArea {
     /// Set the horizontal scroll offset position.
     ///
     /// Positive offset means scrolling right.
+    ///
+    /// The offset is clamped to this frame's scrollable range once the content is measured.
+    /// It stops any kinetic scrolling on that axis, and is never sprung back as an overscroll.
     ///
     /// See also: [`Self::scroll_offset`], [`Ui::scroll_to_cursor`](crate::ui::Ui::scroll_to_cursor) and
     /// [`Response::scroll_to_me`](crate::Response::scroll_to_me)
@@ -822,6 +831,17 @@ impl ScrollArea {
         state.offset.x = offset_x.unwrap_or(state.offset.x);
         state.offset.y = offset_y.unwrap_or(state.offset.y);
 
+        // An offset the caller set is where the content goes this frame. It carries no
+        // momentum, and it is not an overscroll to spring back from, even when it lies outside
+        // last frame's bounds (the viewport or the content may have changed since): it is
+        // clamped to this frame's bounds once the content is measured instead.
+        let offset_set = Vec2b::new(offset_x.is_some(), offset_y.is_some());
+        for d in 0..2 {
+            if offset_set[d] {
+                state.vel[d] = 0.0;
+            }
+        }
+
         let show_bars: Vec2b = match scroll_bar_visibility {
             ScrollBarVisibility::AlwaysHidden => Vec2b::FALSE,
             ScrollBarVisibility::VisibleWhenNeeded => state.show_scroll,
@@ -990,6 +1010,9 @@ impl ScrollArea {
             let hold_overscroll = fingers_on_trackpad && ui.rect_contains_pointer(inner_rect);
 
             for d in 0..2 {
+                if offset_set[d] {
+                    continue;
+                }
                 let physics = &axis_physics[d];
                 if physics.step(&mut state.offset[d], &mut state.vel[d], dt, hold_overscroll) {
                     ctx.request_repaint();

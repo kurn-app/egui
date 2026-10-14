@@ -104,3 +104,46 @@ fn dragging_past_the_top_rubber_bands_and_springs_back() {
     assert_eq!(settled.unclamped_offset(), Vec2::ZERO);
     assert_eq!(settled.velocity(), Vec2::ZERO);
 }
+
+/// An offset the caller sets is kept where it was set, even when it lies past the end of last
+/// frame's scrollable range because the viewport has since shrunk.
+///
+/// A widget that owns its scroll position (like a tab strip with its own arrows) sets it every
+/// frame; springing it back towards last frame's bounds would leave it short of where it was put.
+#[test]
+fn a_set_offset_past_last_frames_end_is_kept() {
+    let height = Arc::new(Mutex::new(150.0_f32));
+    let offset = Arc::new(Mutex::new(0.0_f32));
+    let state = Arc::new(Mutex::new(None));
+    let (height_clone, offset_clone, state_clone) =
+        (Arc::clone(&height), Arc::clone(&offset), Arc::clone(&state));
+
+    let mut harness = Harness::builder()
+        .with_size(Vec2::new(200.0, 200.0))
+        .with_step_dt(1.0 / 60.0)
+        .build_ui(move |ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            let output = ScrollArea::vertical()
+                .max_height(*height_clone.lock())
+                .vertical_scroll_offset(*offset_clone.lock())
+                .show(ui, |ui| {
+                    ui.allocate_exact_size(Vec2::new(100.0, 400.0), egui::Sense::hover());
+                });
+            *state_clone.lock() = Some(output.state);
+        });
+    harness.run_steps(2); // Let the scroll area measure its content: 250 of offset to scroll.
+
+    // Scroll to the end of a viewport 50 shorter, which is past last frame's end:
+    *height.lock() = 100.0;
+    *offset.lock() = 300.0;
+    harness.step();
+    let placed = state_of(&state);
+    assert_eq!(placed.unclamped_offset().y, 300.0);
+    assert_eq!(placed.velocity(), Vec2::ZERO);
+
+    // ...and it stays there:
+    harness.run_steps(10);
+    let settled = state_of(&state);
+    assert_eq!(settled.unclamped_offset().y, 300.0);
+    assert_eq!(settled.velocity(), Vec2::ZERO);
+}
