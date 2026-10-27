@@ -87,6 +87,24 @@ pub fn paint_text_selection(
             for vi in first_vertex_index..last_vertex_index {
                 mesh.vertices[vi].color = text_color;
             }
+
+            // Recolour the selected glyphs' paint records as their quads, so a
+            // painter drawing them from the records draws the selected colour.
+            #[cfg(feature = "glyph_paint")]
+            {
+                let selected = first_glyph_index..last_glyph_index;
+                if row
+                    .glyph_paint
+                    .iter()
+                    .any(|paint| selected.contains(&paint.glyph_index))
+                {
+                    for paint in Arc::make_mut(&mut row.glyph_paint) {
+                        if selected.contains(&paint.glyph_index) {
+                            paint.color = text_color;
+                        }
+                    }
+                }
+            }
         }
 
         // Time to insert the selection rectangle into the row mesh.
@@ -123,8 +141,8 @@ pub fn paint_text_selection(
 
         row.visuals.mesh_bounds = mesh.calc_bounds();
 
-        // The selection rect now lies outside the glyph quads, so the row no
-        // longer separates into per-glyph paint and must be drawn from its mesh.
+        // The highlight's triangles now precede the glyph quads' in the index
+        // list, so the row's glyph run starts six indices later.
         #[cfg(feature = "glyph_paint")]
         {
             row.glyph_paint_check = row.check_glyph_paint();

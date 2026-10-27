@@ -1,3 +1,4 @@
+use core::ops::Range;
 use std::sync::Arc;
 
 use emath::{Pos2, Rect, Vec2};
@@ -21,6 +22,20 @@ pub enum GlyphPaintSource {
     Unsupported,
 }
 
+/// The contiguous run of a row mesh's index list that draws its glyph quads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlyphIndexRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl GlyphIndexRange {
+    /// The run as a range of positions in the mesh's index list.
+    pub fn range(self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
+}
+
 /// How a row's glyph paint relates to its stock mesh. Layout checks it once per
 /// row, so a painter replacing glyph quads need not re-walk the row every frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -29,13 +44,18 @@ pub enum GlyphPaintCheck {
     #[default]
     Unchecked,
     /// Paint occurrences are in strictly increasing glyph order with finite or
-    /// [`Rect::NOTHING`] bounds, each glyph with a stock quad has one, and the
-    /// mesh holds only those quads: four vertices and six indices each, in
-    /// glyph order. A painter may draw any occurrence itself and keep the
-    /// others' stock quads.
-    Separable,
-    /// The mesh also paints backgrounds or decorations around the glyph quads.
-    Decorated,
+    /// [`Rect::NOTHING`] bounds, and each glyph with a stock quad has one. Those
+    /// quads, four vertices each in glyph order, fill
+    /// [`super::RowVisuals::glyph_vertex_range`], and their indices, six per
+    /// quad addressing only that quad, fill `glyphs`. Every other index
+    /// addresses a mesh vertex outside the glyph quads, and the indices before
+    /// `glyphs` are whole triangles.
+    ///
+    /// Triangles before `glyphs` (backgrounds, a selection highlight) paint
+    /// under the glyphs, the rest (underline, strikethrough) over them. A
+    /// painter may draw any occurrence itself and keep the others' stock quads.
+    /// With no stock quad, `glyphs` is empty at the end of the index list.
+    Separable { glyphs: GlyphIndexRange },
     /// The paint occurrences or the mesh layout do not match the glyphs.
     Malformed,
 }
@@ -46,8 +66,9 @@ impl super::Row {
     /// a row's glyphs, paint or mesh structure afterwards recomputes it.
     pub fn check_glyph_paint(&self) -> GlyphPaintCheck {
         let mesh = &self.visuals.mesh;
-        if self.visuals.glyph_vertex_range != (0..mesh.vertices.len()) {
-            return GlyphPaintCheck::Decorated;
+        let quads = self.visuals.glyph_vertex_range.clone();
+        if quads.start > quads.end || quads.end > mesh.vertices.len() {
+            return GlyphPaintCheck::Malformed;
         }
         let mut previous = None;
         for paint in self.glyph_paint.iter() {
@@ -59,8 +80,16 @@ impl super::Row {
             }
             previous = Some(paint.glyph_index);
         }
+        // The glyph run starts at the first index into the first quad, or at
+        // the end of the list when there is no quad.
+        let first_quad = quads.start..(quads.start + 4).min(quads.end);
+        let start = mesh
+            .indices
+            .iter()
+            .position(|&i| first_quad.contains(&(i as usize)))
+            .unwrap_or(mesh.indices.len());
         let mut paints = self.glyph_paint.iter().peekable();
-        let (mut vertex, mut index) = (0, 0);
+        let (mut vertex, mut index) = (quads.start, start);
         for (glyph_index, glyph) in self.glyphs.iter().enumerate() {
             if glyph.uv_rect.is_nothing() {
                 continue;
@@ -78,10 +107,23 @@ impl super::Row {
             vertex += 4;
             index += 6;
         }
-        if vertex != mesh.vertices.len() || index != mesh.indices.len() {
+        let end = index;
+        if vertex != quads.end || start % 3 != 0 {
             return GlyphPaintCheck::Malformed;
         }
-        GlyphPaintCheck::Separable
+        let outside = mesh.indices[..start].iter().chain(&mesh.indices[end..]);
+        for &i in outside {
+            let i = i as usize;
+            if i >= mesh.vertices.len() || quads.contains(&i) {
+                return GlyphPaintCheck::Malformed;
+            }
+        }
+        let (Ok(start), Ok(end)) = (u32::try_from(start), u32::try_from(end)) else {
+            return GlyphPaintCheck::Malformed;
+        };
+        GlyphPaintCheck::Separable {
+            glyphs: GlyphIndexRange { start, end },
+        }
     }
 }
 
@@ -173,24 +215,62 @@ mod tests {
         assert!((a - b).length() < 1e-4, "{a:?} != {b:?}");
     }
 
+    fn separable(row: &super::super::Row) -> GlyphIndexRange {
+        match row.check_glyph_paint() {
+            GlyphPaintCheck::Separable { glyphs } => glyphs,
+            check => panic!("expected a separable row: {check:?}"),
+        }
+    }
+
     #[test]
     fn layout_checks_row_glyph_paint_against_glyphs_and_mesh() {
         let mut fonts = ubuntu(FontTweak::default());
         let galley = layout(&mut fonts, 1.0, Arc::new(job("Ab c")));
         let row = &galley.rows[0].row;
-        assert_eq!(row.glyph_paint_check, GlyphPaintCheck::Separable);
-        assert_eq!(row.check_glyph_paint(), GlyphPaintCheck::Separable);
-
-        let mut underlined = job("Ab");
-        underlined.sections[0].format.underline = crate::Stroke::new(1.0, Color32::RED);
-        let decorated = layout(&mut fonts, 1.0, Arc::new(underlined));
+        // A plain row's glyph run is its whole index list.
+        let whole = GlyphIndexRange {
+            start: 0,
+            end: row.visuals.mesh.indices.len() as u32,
+        };
+        assert_eq!(whole.end, 18, "three quads of six indices");
         assert_eq!(
-            decorated.rows[0].glyph_paint_check,
-            GlyphPaintCheck::Decorated
+            row.glyph_paint_check,
+            GlyphPaintCheck::Separable { glyphs: whole }
         );
+        assert_eq!(separable(row), whole);
 
-        let malformed = |edit: &dyn Fn(&mut super::super::Row)| {
-            let mut row = (**row).clone();
+        // A background, an underline and a strikethrough: the run starts at the
+        // first glyph index, six indices per stock quad.
+        let mut rich = job("Ab");
+        rich.sections[0].format.background = Color32::GREEN;
+        rich.sections[0].format.underline = crate::Stroke::new(1.0, Color32::RED);
+        rich.sections[0].format.strikethrough = crate::Stroke::new(1.0, Color32::RED);
+        let rich = layout(&mut fonts, 1.0, Arc::new(rich));
+        let decorated = &rich.rows[0].row;
+        let quads = decorated
+            .glyphs
+            .iter()
+            .filter(|glyph| !glyph.uv_rect.is_nothing())
+            .count();
+        assert_eq!(quads, 2);
+        let start = decorated.visuals.glyph_index_start;
+        assert!(start > 0, "the background draws first");
+        let glyphs = GlyphIndexRange {
+            start: start as u32,
+            end: (start + 6 * quads) as u32,
+        };
+        assert!(
+            glyphs.range().end < decorated.visuals.mesh.indices.len(),
+            "the decorations draw last"
+        );
+        assert_eq!(
+            decorated.glyph_paint_check,
+            GlyphPaintCheck::Separable { glyphs }
+        );
+        assert_eq!(separable(decorated), glyphs);
+
+        let edited = |row: &super::super::Row, edit: &dyn Fn(&mut super::super::Row)| {
+            let mut row = row.clone();
             edit(&mut row);
             row.check_glyph_paint()
         };
@@ -199,28 +279,42 @@ mod tests {
             edit(&mut paints);
             row.glyph_paint = paints.into();
         };
+        // A background index moved into the second glyph's quad.
+        let second_quad = decorated.glyphs[1].first_vertex;
+        assert_eq!(
+            edited(decorated, &|row| row.visuals.mesh.indices[0] = second_quad),
+            GlyphPaintCheck::Malformed
+        );
+        // A decoration index at the vertex count.
+        assert_eq!(
+            edited(decorated, &|row| {
+                let past = row.visuals.mesh.vertices.len() as u32;
+                *row.visuals.mesh.indices.last_mut().unwrap() = past;
+            }),
+            GlyphPaintCheck::Malformed
+        );
         // Paint occurrences out of glyph order.
         assert_eq!(
-            malformed(&|row| with_paints(row, &|p| p.swap(0, 1))),
+            edited(row, &|row| with_paints(row, &|p| p.swap(0, 1))),
             GlyphPaintCheck::Malformed
         );
         // A stock quad without its paint occurrence.
         assert_eq!(
-            malformed(&|row| with_paints(row, &|p| {
+            edited(row, &|row| with_paints(row, &|p| {
                 p.remove(0);
             })),
             GlyphPaintCheck::Malformed
         );
         // Non-finite paint bounds.
         assert_eq!(
-            malformed(&|row| with_paints(row, &|p| {
+            edited(row, &|row| with_paints(row, &|p| {
                 p[0].bounds = Rect::from_min_max(pos2(0.0, 0.0), pos2(f32::INFINITY, 1.0));
             })),
             GlyphPaintCheck::Malformed
         );
         // A triangle reaching into the next glyph's quad.
         assert_eq!(
-            malformed(&|row| row.visuals.mesh.indices[0] = 4),
+            edited(row, &|row| row.visuals.mesh.indices[0] = 4),
             GlyphPaintCheck::Malformed
         );
         // Unserialized rows are never checked.
