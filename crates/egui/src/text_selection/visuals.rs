@@ -123,6 +123,13 @@ pub fn paint_text_selection(
 
         row.visuals.mesh_bounds = mesh.calc_bounds();
 
+        // The selection rect now lies outside the glyph quads, so the row no
+        // longer separates into per-glyph paint and must be drawn from its mesh.
+        #[cfg(feature = "glyph_paint")]
+        {
+            row.glyph_paint_check = row.check_glyph_paint();
+        }
+
         if let Some(new_vertex_indices) = &mut new_vertex_indices {
             new_vertex_indices.push(RowVertexIndices {
                 row: ri,
