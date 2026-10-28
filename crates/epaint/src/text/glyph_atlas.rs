@@ -338,10 +338,22 @@ impl GlyphAtlas {
     /// Lay glyphs out in `mode` from now on. Returns whether it changed.
     ///
     /// Bitmaps already prepared stay; a glyph laid out without its bitmap gets it at its next
-    /// lookup in [`crate::text::GlyphPaintMode::Bitmaps`].
+    /// lookup outside [`crate::text::GlyphPaintMode::Outlines`]. Leaving
+    /// [`crate::text::GlyphPaintMode::Off`] starts the atlas over, since its glyphs have no paint
+    /// source.
     #[cfg(feature = "glyph_paint")]
     pub fn set_glyph_paint_mode(&mut self, mode: crate::text::GlyphPaintMode) -> bool {
-        core::mem::replace(&mut self.paint.mode, mode) != mode
+        let old = core::mem::replace(&mut self.paint.mode, mode);
+        if old == crate::text::GlyphPaintMode::Off && mode != old {
+            self.clear();
+        }
+        old != mode
+    }
+
+    /// Count `records` glyph paint records built by layout.
+    #[cfg(feature = "glyph_paint")]
+    pub fn count_paint_records(&mut self, records: usize) {
+        self.paint.counters.paint_records += records as u64;
     }
 
     /// Give these glyphs their bitmaps in every mode, from their next lookup on. Returns how many
@@ -431,11 +443,17 @@ impl GlyphAtlas {
                 ..
             } = self;
             let cached = outline_glyphs.entry(key).or_insert_with(|| {
-                Self::prepare_outline(atlas, paint, face, metrics, glyph_id, bin)
+                if paint.mode == crate::text::GlyphPaintMode::Off {
+                    let (allocation, _) =
+                        Self::rasterize_outline(atlas, face, metrics, glyph_id, bin);
+                    OutlineGlyph::unpainted(allocation, 0)
+                } else {
+                    Self::prepare_outline(atlas, paint, face, metrics, glyph_id, bin)
+                }
             });
             if cached.skipped
                 && let Some(paint_font) = &cached.paint_font
-                && (paint.mode == crate::text::GlyphPaintMode::Bitmaps
+                && (paint.mode != crate::text::GlyphPaintMode::Outlines
                     || paint
                         .requested
                         .contains(&(paint_font.id(), glyph_id.to_u32())))

@@ -1416,7 +1416,8 @@ impl Context {
     /// Which glyphs text layout prepares bitmaps for, from the start of the next pass on.
     ///
     /// See [`epaint::text::GlyphPaintMode`]. A change drops every cached layout, and keeps the
-    /// fonts, their [`epaint::text::FontInstanceId`]s and the font atlas.
+    /// fonts and their [`epaint::text::FontInstanceId`]s. It keeps the font atlas, except when
+    /// leaving [`epaint::text::GlyphPaintMode::Off`].
     #[cfg(feature = "glyph_paint")]
     pub fn set_glyph_paint_mode(&self, mode: epaint::text::GlyphPaintMode) {
         self.write(|ctx| ctx.glyph_paint_mode = mode);
@@ -1450,7 +1451,7 @@ impl Context {
         new
     }
 
-    /// Bitmap work done for outline glyphs since this context was created, across font reloads.
+    /// Glyph paint work done since this context was created, across font reloads.
     ///
     /// See [`epaint::text::GlyphPaintCounters`].
     #[cfg(feature = "glyph_paint")]

@@ -115,6 +115,10 @@ struct PaintLayout {
     #[cfg(feature = "glyph_paint")]
     needs_bitmaps: bool,
 
+    /// Set in [`super::GlyphPaintMode::Off`]: no record is built and no row checked.
+    #[cfg(feature = "glyph_paint")]
+    off: bool,
+
     /// See `FontsImpl::invisible_test_char`.
     #[cfg(all(test, feature = "glyph_paint"))]
     invisible_test_char: Option<char>,
@@ -143,6 +147,9 @@ impl PaintLayout {
         origin_px: f32,
         offset_px: Vec2,
     ) {
+        if self.off {
+            return;
+        }
         #[cfg(test)]
         let invisible = self.invisible_test_char == Some(glyph.chr);
         #[cfg(not(test))]
@@ -170,6 +177,9 @@ impl PaintLayout {
     }
 
     fn raster(&mut self, glyph: &mut Glyph) {
+        if self.off {
+            return;
+        }
         glyph.paint_index =
             u32::try_from(self.records.len()).expect("too many glyph paint records");
         self.records.push(PendingPaint {
@@ -184,7 +194,11 @@ impl PaintLayout {
         });
     }
 
+    /// Resolve `row`'s paint records and check them against its mesh.
     fn finish_row(&self, point_scale: PointScale, job: &LayoutJob, row: &mut Row) {
+        if self.off {
+            return;
+        }
         row.glyph_paint = row
             .glyphs
             .iter()
@@ -243,6 +257,7 @@ impl PaintLayout {
                 Some(paint)
             })
             .collect();
+        row.glyph_paint_check = row.check_glyph_paint();
     }
 }
 
@@ -337,6 +352,10 @@ fn layout_in_mode(
     // For most of this we ignore the y coordinate:
 
     let mut paint = PaintLayout::default();
+    #[cfg(feature = "glyph_paint")]
+    {
+        paint.off = fonts.glyph_paint_mode() == super::GlyphPaintMode::Off;
+    }
     #[cfg(all(test, feature = "glyph_paint"))]
     {
         paint.invisible_test_char = fonts.invisible_test_char;
@@ -402,6 +421,8 @@ fn layout_in_mode(
     #[cfg(not(feature = "glyph_paint"))]
     let needs_bitmaps = false;
     let galley = galley_from_rows(point_scale, job, rows, elided, intrinsic_size, paint);
+    #[cfg(feature = "glyph_paint")]
+    fonts.count_paint_records(galley.rows.iter().map(|row| row.glyph_paint.len()).sum());
     (galley, needs_bitmaps)
 }
 
@@ -1458,10 +1479,7 @@ fn galley_from_rows(
         num_indices += row.visuals.mesh.indices.len();
 
         #[cfg(feature = "glyph_paint")]
-        {
-            _paint.finish_row(point_scale, &job, row);
-            row.glyph_paint_check = row.check_glyph_paint();
-        }
+        _paint.finish_row(point_scale, &job, row);
 
         row.section_index_at_start = u32::MAX; // No longer in use.
         for glyph in &mut row.glyphs {

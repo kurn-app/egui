@@ -408,6 +408,7 @@ mod tests {
         let data = FontData::from_static(epaint_default_fonts::UBUNTU_LIGHT);
         let provided = data.clone();
         let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::empty());
+        fonts.set_glyph_paint_mode(crate::text::GlyphPaintMode::Bitmaps);
         fonts.set_font_providers(vec![Arc::new(move |request: &FallbackRequest<'_>| {
             Some(FontInsert::new(
                 "discovered",

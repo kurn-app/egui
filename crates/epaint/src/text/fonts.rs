@@ -105,7 +105,8 @@ impl Fonts {
         }
     }
 
-    /// Which glyphs layout prepares bitmaps for. See [`super::GlyphPaintMode`].
+    /// Whether layout builds glyph paint, and for which glyphs it prepares bitmaps. See
+    /// [`super::GlyphPaintMode`].
     #[cfg(feature = "glyph_paint")]
     #[inline]
     pub fn glyph_paint_mode(&self) -> super::GlyphPaintMode {
@@ -114,8 +115,9 @@ impl Fonts {
 
     /// Lay text out in `mode` from now on. See [`super::GlyphPaintMode`].
     ///
-    /// A change drops every cached layout, and keeps the fonts, their
-    /// [`super::FontInstanceId`]s and the font atlas.
+    /// A change drops every cached layout, and keeps the fonts and their
+    /// [`super::FontInstanceId`]s. It keeps the font atlas, except when leaving
+    /// [`super::GlyphPaintMode::Off`].
     #[cfg(feature = "glyph_paint")]
     pub fn set_glyph_paint_mode(&mut self, mode: super::GlyphPaintMode) {
         if self.fonts.glyphs.set_glyph_paint_mode(mode) {
@@ -139,7 +141,7 @@ impl Fonts {
         new
     }
 
-    /// Bitmap work done for outline glyphs since these [`Fonts`] were created.
+    /// Glyph paint work done since these [`Fonts`] were created.
     #[cfg(feature = "glyph_paint")]
     #[inline]
     pub fn glyph_paint_counters(&self) -> super::GlyphPaintCounters {
@@ -629,6 +631,12 @@ impl FontsImpl {
     #[cfg(feature = "glyph_paint")]
     pub fn set_glyph_paint_mode(&mut self, mode: super::GlyphPaintMode) {
         self.glyphs.set_glyph_paint_mode(mode);
+    }
+
+    /// Count `records` glyph paint records built by layout.
+    #[cfg(feature = "glyph_paint")]
+    pub(crate) fn count_paint_records(&mut self, records: usize) {
+        self.glyphs.count_paint_records(records);
     }
 
     #[cfg(all(test, feature = "glyph_paint"))]

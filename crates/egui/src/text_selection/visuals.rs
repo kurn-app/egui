@@ -147,7 +147,9 @@ pub fn paint_text_selection(
                 // The highlight's triangles now precede the glyph quads' in the index
                 // list, so the row's glyph triangles start six indices later.
                 row.visuals.glyph_index_start += 6;
-                row.glyph_paint_check = row.check_glyph_paint();
+                if row.glyph_paint_check != epaint::text::GlyphPaintCheck::Unchecked {
+                    row.glyph_paint_check = row.check_glyph_paint();
+                }
             }
             _ => {
                 row.visuals.mesh_bounds = mesh.calc_bounds();

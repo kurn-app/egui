@@ -22,16 +22,21 @@ pub enum GlyphPaintSource {
     Unsupported,
 }
 
-/// Which glyphs layout prepares bitmaps for.
+/// Whether layout builds glyph paint records, and which glyphs it prepares bitmaps for.
 ///
-/// Set with [`crate::text::Fonts::set_glyph_paint_mode`]. A painter that draws outline glyphs
-/// itself selects [`Self::Outlines`], so layout spends no rasterization, atlas space or upload on
-/// glyphs it never shows, and asks for the bitmaps of any it hands back to the stock path with
+/// Set with [`crate::text::Fonts::set_glyph_paint_mode`]. Glyph paint is opt-in: in the default,
+/// [`Self::Off`], layout is stock's. A painter that draws outline glyphs itself selects
+/// [`Self::Outlines`], so layout spends no rasterization, atlas space or upload on glyphs it never
+/// shows, and asks for the bitmaps of any it hands back to the stock path with
 /// [`crate::text::Fonts::request_glyph_bitmaps`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GlyphPaintMode {
-    /// Every glyph gets its bitmap, atlas slot and mesh quad, as without glyph paint.
+    /// No glyph paint: layout resolves no paint source and builds no
+    /// [`super::Row::glyph_paint`] record, and leaves every row's
+    /// [`super::Row::glyph_paint_check`] [`GlyphPaintCheck::Unchecked`].
     #[default]
+    Off,
+    /// Every glyph gets its paint record, and its bitmap, atlas slot and mesh quad as stock.
     Bitmaps,
     /// A glyph whose source is [`GlyphPaintSource::Outline`] or [`GlyphPaintSource::Empty`] gets
     /// no bitmap, atlas slot or mesh quad, unless its bitmap was requested. Its
@@ -43,15 +48,16 @@ pub enum GlyphPaintMode {
     Outlines,
 }
 
-/// Bitmap work done for glyphs a painter could draw from their outlines: totals since the
-/// [`crate::text::Fonts`] were created.
+/// Glyph paint work: totals since the [`crate::text::Fonts`] were created.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlyphPaintCounters {
-    /// Rasterizations of a glyph whose paint source is [`GlyphPaintSource::Outline`], in either
-    /// [`GlyphPaintMode`].
+    /// Rasterizations of a glyph whose paint source is known to be
+    /// [`GlyphPaintSource::Outline`]. [`GlyphPaintMode::Off`] resolves no source for a new glyph.
     pub outline_bitmaps: u64,
     /// Font atlas texels those bitmaps take. The atlas uploads only allocated texels.
     pub outline_bitmap_texels: u64,
+    /// [`GlyphPaint`] records layout built, counting a galley laid out again.
+    pub paint_records: u64,
 }
 
 impl core::ops::Add for GlyphPaintCounters {
@@ -61,6 +67,7 @@ impl core::ops::Add for GlyphPaintCounters {
         Self {
             outline_bitmaps: self.outline_bitmaps + other.outline_bitmaps,
             outline_bitmap_texels: self.outline_bitmap_texels + other.outline_bitmap_texels,
+            paint_records: self.paint_records + other.paint_records,
         }
     }
 }
@@ -247,7 +254,9 @@ mod tests {
         definitions
             .families
             .insert(FontFamily::Proportional, vec!["Ubuntu".into()]);
-        FontsImpl::new(TextOptions::default(), definitions)
+        let mut fonts = FontsImpl::new(TextOptions::default(), definitions);
+        fonts.set_glyph_paint_mode(GlyphPaintMode::Bitmaps);
+        fonts
     }
 
     fn job(text: &str) -> LayoutJob {
@@ -758,6 +767,7 @@ mod tests {
         // The icon is a private-use glyph only the bundled icon face has, so it resolves
         // through fallback to a second instance under every default font set.
         let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
+        fonts.set_glyph_paint_mode(GlyphPaintMode::Bitmaps);
         let text = format!("A{}", epaint_default_fonts::special_emojis::GITHUB);
         let galley = layout(&mut fonts, 1.0, Arc::new(job(&text)));
         let paint = &galley.rows[0].glyph_paint;
@@ -779,6 +789,7 @@ mod tests {
         let data = FontData::from_static(epaint_default_fonts::UBUNTU_LIGHT);
         let provided = data.clone();
         let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::empty());
+        fonts.set_glyph_paint_mode(GlyphPaintMode::Bitmaps);
         fonts.set_font_providers(vec![Arc::new(move |request: &FallbackRequest<'_>| {
             Some(FontInsert::new(
                 "discovered",
@@ -802,6 +813,7 @@ mod tests {
         );
 
         let mut fontless = FontsImpl::new(TextOptions::default(), FontDefinitions::empty());
+        fontless.set_glyph_paint_mode(GlyphPaintMode::Bitmaps);
         let tofu = layout(&mut fontless, 1.0, Arc::new(job("A")));
         assert_eq!(
             tofu.rows[0].glyph_paint[0].source,
@@ -898,14 +910,69 @@ mod tests {
         mesh
     }
 
+    /// In the default mode layout builds no paint record and is stock's. Leaving it, the glyphs it
+    /// prepared are prepared again with their paint sources.
+    #[test]
+    fn off_mode_builds_no_paint_records() {
+        let fonts = || ubuntu(FontTweak::default()).with_glyph_rasterizer(raster(false));
+        let mut stock = fonts();
+        stock.set_glyph_paint_mode(GlyphPaintMode::Off);
+        let off = layout(&mut stock, 1.0, Arc::new(mixed_job()));
+        assert_eq!(
+            stock.glyphs().glyph_paint_counters(),
+            GlyphPaintCounters::default(),
+            "no record is built and no source resolved"
+        );
+        assert!(
+            off.rows.iter().all(|row| row.glyph_paint.is_empty()
+                && row.glyph_paint_check == GlyphPaintCheck::Unchecked)
+        );
+
+        let mut painted = fonts();
+        let bitmaps = layout(&mut painted, 1.0, Arc::new(mixed_job()));
+        let records: usize = bitmaps.rows.iter().map(|row| row.glyph_paint.len()).sum();
+        assert!(records > 0);
+        assert_eq!(
+            painted.glyphs().glyph_paint_counters().paint_records,
+            records as u64
+        );
+        assert_eq!(off.rect, bitmaps.rect);
+        assert_eq!(off.mesh_bounds, bitmaps.mesh_bounds);
+        for (off_row, bitmap_row) in off.rows.iter().zip(&bitmaps.rows) {
+            assert_eq!(
+                off_row.visuals.mesh, bitmap_row.visuals.mesh,
+                "the stock mesh"
+            );
+        }
+
+        stock.set_glyph_paint_mode(GlyphPaintMode::Outlines);
+        let outlines = layout(&mut stock, 1.0, Arc::new(mixed_job()));
+        let outline_glyphs = outlines
+            .rows
+            .iter()
+            .flat_map(|row| {
+                row.glyph_paint.iter().filter(|paint| {
+                    paint.source == GlyphPaintSource::Outline
+                        && row.glyphs[paint.glyph_index].uv_rect.is_nothing()
+                })
+            })
+            .count();
+        assert_eq!(outline_glyphs, 5, "b, j, f, g and q, without their quads");
+        assert_eq!(
+            stock.glyphs().glyph_paint_counters().paint_records,
+            records as u64
+        );
+    }
+
     #[test]
     fn outline_mode_layout_matches_bitmap_mode_without_outline_quads() {
         let mut fonts = ubuntu(FontTweak::default()).with_glyph_rasterizer(raster(false));
         fonts.set_glyph_paint_mode(GlyphPaintMode::Outlines);
         let outlines = layout(&mut fonts, 1.0, Arc::new(mixed_job()));
+        let counters = fonts.glyphs().glyph_paint_counters();
         assert_eq!(
-            fonts.glyphs().glyph_paint_counters(),
-            GlyphPaintCounters::default(),
+            (counters.outline_bitmaps, counters.outline_bitmap_texels),
+            (0, 0),
             "no outline glyph is rasterized"
         );
         fonts.set_glyph_paint_mode(GlyphPaintMode::Bitmaps);
