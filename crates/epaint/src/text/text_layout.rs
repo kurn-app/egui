@@ -64,14 +64,42 @@ pub(super) const ITALIC_SHEAR: f32 = 0.25;
 /// The pixel-rounded quad the stock path draws a glyph's bitmap into, or `None` when the glyph
 /// has no bitmap.
 fn bitmap_quad(point_scale: PointScale, glyph: &Glyph) -> Option<Rect> {
-    let uv_rect = glyph.uv_rect;
-    if uv_rect.is_nothing() {
+    if glyph.uv_rect.is_nothing() {
         return None;
     }
+    Some(quad_rect(point_scale, glyph))
+}
+
+/// The pixel-rounded rect of a glyph's bitmap quad, from its [`super::UvRect`] offset and size.
+fn quad_rect(point_scale: PointScale, glyph: &Glyph) -> Rect {
+    let uv_rect = glyph.uv_rect;
     let mut left_top = glyph.pos + uv_rect.offset;
     left_top.x = point_scale.round_to_pixel(left_top.x);
     left_top.y = point_scale.round_to_pixel(left_top.y);
-    Some(Rect::from_min_max(left_top, left_top + uv_rect.size))
+    Rect::from_min_max(left_top, left_top + uv_rect.size)
+}
+
+/// The rect of a glyph's bitmap quad, whether or not the glyph was laid out with its bitmap, or
+/// `None` when it has no bitmap to draw.
+#[cfg(feature = "glyph_paint")]
+fn glyph_box(point_scale: PointScale, glyph: &Glyph) -> Option<Rect> {
+    (glyph.uv_rect.size != Vec2::ZERO).then(|| quad_rect(point_scale, glyph))
+}
+
+/// The corners of the quad drawing a bitmap into `rect`, in vertex order: left top, right top,
+/// left bottom, right bottom. Synthetic italics shear the top edge right.
+fn quad_corners(rect: Rect, italics: bool) -> [Pos2; 4] {
+    let top_offset = if italics {
+        rect.height() * ITALIC_SHEAR * Vec2::X
+    } else {
+        Vec2::ZERO
+    };
+    [
+        rect.left_top() + top_offset,
+        rect.right_top() + top_offset,
+        rect.left_bottom(),
+        rect.right_bottom(),
+    ]
 }
 
 // ----------------------------------------------------------------------------
@@ -81,6 +109,15 @@ fn bitmap_quad(point_scale: PointScale, glyph: &Glyph) -> Option<Rect> {
 struct PaintLayout {
     #[cfg(feature = "glyph_paint")]
     records: Vec<PendingPaint>,
+
+    /// Set when a glyph with no paint record was laid out without its bitmap, so the galley
+    /// would lose its ink and must be laid out again with every bitmap.
+    #[cfg(feature = "glyph_paint")]
+    needs_bitmaps: bool,
+
+    /// See `FontsImpl::invisible_test_char`.
+    #[cfg(all(test, feature = "glyph_paint"))]
+    invisible_test_char: Option<char>,
 }
 
 #[cfg(feature = "glyph_paint")]
@@ -106,8 +143,16 @@ impl PaintLayout {
         origin_px: f32,
         offset_px: Vec2,
     ) {
-        if outline.paint_font.is_none() || super::unicode::invisible_char(glyph.chr) {
-            return; // Invisible/control records have no resolved paint occurrence.
+        #[cfg(test)]
+        let invisible = self.invisible_test_char == Some(glyph.chr);
+        #[cfg(not(test))]
+        let invisible = false;
+        let invisible = invisible || super::unicode::invisible_char(glyph.chr);
+        if outline.paint_font.is_none() || invisible {
+            // Invisible/control records have no resolved paint occurrence, so nothing but the
+            // stock bitmap can draw an inked glyph of one.
+            self.needs_bitmaps |= outline.skipped;
+            return;
         }
         let scale = metrics.px_scale_factor / metrics.pixels_per_point;
         glyph.paint_index =
@@ -162,7 +207,9 @@ impl PaintLayout {
                         || pending.source == super::GlyphPaintSource::FontColor,
                     bounds: Rect::NOTHING,
                 };
-                let quad = bitmap_quad(point_scale, glyph);
+                // The bitmap's quad, laid out with or without it, so both glyph paint modes give
+                // equal bounds and pivots.
+                let quad = glyph_box(point_scale, glyph);
                 if pending.source == super::GlyphPaintSource::Outline {
                     for corner in [
                         pending.outline_bounds.left_top(),
@@ -179,7 +226,7 @@ impl PaintLayout {
                 }
                 if format.italics && paint.bounds.is_positive() {
                     paint.shear = ITALIC_SHEAR;
-                    // Match the stock bitmap shear pivot while bitmap preparation is enabled.
+                    // Match the stock bitmap shear pivot.
                     paint.shear_origin_y = quad.map_or(paint.bounds.max.y, |quad| quad.max.y);
                     let bounds = paint.bounds;
                     paint.bounds = Rect::NOTHING;
@@ -230,13 +277,50 @@ impl Paragraph {
 /// In most cases you should use [`crate::FontsView::layout_job`] instead
 /// since that memoizes the input, making subsequent layouting of the same text much faster.
 pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>) -> Galley {
+    #[cfg(feature = "glyph_paint")]
+    if fonts.glyph_paint_mode() == super::GlyphPaintMode::Outlines {
+        #[cfg_attr(not(test), expect(unused_mut))]
+        let (mut galley, needs_bitmaps) = layout_in_mode(fonts, pixels_per_point, Arc::clone(&job));
+        #[cfg(test)]
+        if let Some(row) = fonts.malformed_outlines_row
+            && let Some(placed) = galley.rows.get_mut(row)
+        {
+            Arc::make_mut(&mut placed.row).glyph_paint_check = super::GlyphPaintCheck::Malformed;
+        }
+        let separable = galley.rows.iter().all(|row| {
+            matches!(
+                row.glyph_paint_check,
+                super::GlyphPaintCheck::Separable { .. }
+            )
+        });
+        if separable && !needs_bitmaps {
+            return galley;
+        }
+        // A painter draws a row it cannot separate from its mesh with the stock mesh, and an
+        // invisible character's glyph only from its bitmap, so the galley needs every glyph's
+        // bitmap.
+        fonts.set_glyph_paint_mode(super::GlyphPaintMode::Bitmaps);
+        let (galley, _) = layout_in_mode(fonts, pixels_per_point, job);
+        fonts.set_glyph_paint_mode(super::GlyphPaintMode::Outlines);
+        return galley;
+    }
+    layout_in_mode(fonts, pixels_per_point, job).0
+}
+
+/// [`layout`] in the fonts' current glyph paint mode, and whether a glyph that only its bitmap
+/// can draw was laid out without it.
+fn layout_in_mode(
+    fonts: &mut FontsImpl,
+    pixels_per_point: f32,
+    job: Arc<LayoutJob>,
+) -> (Galley, bool) {
     profiling::function_scope!();
 
     job.debug_sanity_check();
 
     if job.wrap.max_rows == 0 {
         // Early-out: no text
-        return Galley {
+        let galley = Galley {
             job,
             rows: Default::default(),
             rect: Rect::ZERO,
@@ -247,11 +331,16 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
             elided: true,
             intrinsic_size: Vec2::ZERO,
         };
+        return (galley, false);
     }
 
     // For most of this we ignore the y coordinate:
 
     let mut paint = PaintLayout::default();
+    #[cfg(all(test, feature = "glyph_paint"))]
+    {
+        paint.invisible_test_char = fonts.invisible_test_char;
+    }
     let mut paragraphs = vec![Paragraph::from_section_index(0)];
     {
         let mut shape_buffer = fonts.take_shape_buffer();
@@ -308,7 +397,12 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
     }
 
     // Calculate the Y positions and tessellate the text:
-    galley_from_rows(point_scale, job, rows, elided, intrinsic_size, paint)
+    #[cfg(feature = "glyph_paint")]
+    let needs_bitmaps = paint.needs_bitmaps;
+    #[cfg(not(feature = "glyph_paint"))]
+    let needs_bitmaps = false;
+    let galley = galley_from_rows(point_scale, job, rows, elided, intrinsic_size, paint);
+    (galley, needs_bitmaps)
 }
 
 /// Shared context for emitting shaped glyphs into a [`Paragraph`].
@@ -1457,7 +1551,22 @@ fn tessellate_row(
         });
     }
 
-    let mesh_bounds = mesh.calc_bounds();
+    #[cfg_attr(not(feature = "glyph_paint"), expect(unused_mut))]
+    let mut mesh_bounds = mesh.calc_bounds();
+
+    // A glyph laid out without its bitmap still bounds the row where its quad would be, so the
+    // row's bounds, and a shape underline along them, are those of a row with every quad.
+    #[cfg(feature = "glyph_paint")]
+    for glyph in &row.glyphs {
+        if glyph.uv_rect.is_nothing()
+            && let Some(rect) = glyph_box(point_scale, glyph)
+        {
+            let italics = job.sections[glyph.section_index as usize].format.italics;
+            for corner in quad_corners(rect, italics) {
+                mesh_bounds.extend_with(corner);
+            }
+        }
+    }
 
     RowVisuals {
         mesh,
@@ -1535,28 +1644,15 @@ fn tessellate_glyphs(point_scale: PointScale, job: &LayoutJob, row: &mut Row, me
                 mesh.add_triangle(idx, idx + 1, idx + 2);
                 mesh.add_triangle(idx + 2, idx + 1, idx + 3);
 
-                let top_offset = rect.height() * ITALIC_SHEAR * Vec2::X;
-
-                mesh.vertices.push(Vertex {
-                    pos: rect.left_top() + top_offset,
-                    uv: uv.left_top(),
-                    color,
-                });
-                mesh.vertices.push(Vertex {
-                    pos: rect.right_top() + top_offset,
-                    uv: uv.right_top(),
-                    color,
-                });
-                mesh.vertices.push(Vertex {
-                    pos: rect.left_bottom(),
-                    uv: uv.left_bottom(),
-                    color,
-                });
-                mesh.vertices.push(Vertex {
-                    pos: rect.right_bottom(),
-                    uv: uv.right_bottom(),
-                    color,
-                });
+                let uvs = [
+                    uv.left_top(),
+                    uv.right_top(),
+                    uv.left_bottom(),
+                    uv.right_bottom(),
+                ];
+                for (pos, uv) in iter::zip(quad_corners(rect, true), uvs) {
+                    mesh.vertices.push(Vertex { pos, uv, color });
+                }
             } else {
                 mesh.add_rect_with_uv(rect, uv, color);
             }

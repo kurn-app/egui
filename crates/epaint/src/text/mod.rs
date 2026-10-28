@@ -85,7 +85,10 @@ impl Default for TextOptions {
 }
 
 #[cfg(feature = "glyph_paint")]
-pub use glyph_paint::{GlyphIndexRange, GlyphPaint, GlyphPaintCheck, GlyphPaintSource};
+pub use glyph_paint::{
+    GlyphIndexRange, GlyphPaint, GlyphPaintCheck, GlyphPaintCounters, GlyphPaintMode,
+    GlyphPaintSource,
+};
 
 #[cfg(feature = "glyph_paint")]
 pub use font_paint::{

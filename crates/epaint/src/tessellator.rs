@@ -2272,7 +2272,13 @@ impl Tessellator {
         let rotator = Rot2::from_angle(*angle);
 
         for row in &galley.rows {
-            if row.visuals.mesh.is_empty() {
+            // A row laid out without its glyphs' bitmaps keeps their bounds, and draws its
+            // shape underline along them.
+            #[cfg(feature = "glyph_paint")]
+            let skip = row.visuals.mesh.is_empty() && row.visuals.mesh_bounds == Rect::NOTHING;
+            #[cfg(not(feature = "glyph_paint"))]
+            let skip = row.visuals.mesh.is_empty();
+            if skip {
                 continue;
             }
 

@@ -139,13 +139,19 @@ pub fn paint_text_selection(
         mesh.indices[glyph_index_start..glyph_index_start + 6]
             .clone_from_slice(&selection_triangles);
 
-        row.visuals.mesh_bounds = mesh.calc_bounds();
+        core::cfg_select! {
+            feature = "glyph_paint" => {
+                // Glyphs laid out without their bitmaps keep bounding the row.
+                row.visuals.mesh_bounds = row.visuals.mesh_bounds.union(mesh.calc_bounds());
 
-        // The highlight's triangles now precede the glyph quads' in the index
-        // list, so the row's glyph run starts six indices later.
-        #[cfg(feature = "glyph_paint")]
-        {
-            row.glyph_paint_check = row.check_glyph_paint();
+                // The highlight's triangles now precede the glyph quads' in the index
+                // list, so the row's glyph triangles start six indices later.
+                row.visuals.glyph_index_start += 6;
+                row.glyph_paint_check = row.check_glyph_paint();
+            }
+            _ => {
+                row.visuals.mesh_bounds = mesh.calc_bounds();
+            }
         }
 
         if let Some(new_vertex_indices) = &mut new_vertex_indices {

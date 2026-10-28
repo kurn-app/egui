@@ -90,29 +90,18 @@ impl FontCell {
         scale / units_per_em
     }
 
-    /// Render a glyph to a bitmap: a color glyph if the font has one, else the outline as coverage.
+    /// The glyph's outline as [`Self::rasterize_glyph`] fills it: in pixels with Y down, at the
+    /// sub-pixel bin, and hinted when the face hints.
     ///
-    /// Returns `None` if the glyph has neither (e.g. a space).
-    fn rasterize_glyph(
+    /// Returns `None` if the face has no outline for the glyph or drawing it fails.
+    fn draw_outline(
         &mut self,
         metrics: &StyledMetrics,
         glyph_id: GlyphId,
         bin: SubpixelBin,
         hinting_target: skrifa::outline::Target,
-    ) -> Option<GlyphBitmap> {
+    ) -> Option<kurbo::BezPath> {
         let location: skrifa::instance::LocationRef<'_> = (&metrics.location).into();
-
-        // Color emoji fonts often have empty outlines next to their bitmap or `COLR` glyphs,
-        // so try those first:
-        core::cfg_select! {
-            feature = "color_fonts" => {
-                if let Some(bitmap) = self.rasterize_color_glyph(metrics, glyph_id, location) {
-                    return Some(bitmap);
-                }
-            }
-            _ => {}
-        }
-
         let mut path = kurbo::BezPath::new();
         let mut pen = VelloPen {
             path: &mut path,
@@ -144,13 +133,33 @@ impl FontCell {
 
             Some(())
         })?;
+        Some(path)
+    }
 
-        let bounds = path.control_box().expand();
-        let width = bounds.width() as u16;
-        let height = bounds.height() as u16;
-        if width == 0 || height == 0 {
-            return None;
+    /// Render a glyph to a bitmap: a color glyph if the font has one, else the outline as coverage.
+    ///
+    /// Returns `None` if the glyph has neither (e.g. a space).
+    fn rasterize_glyph(
+        &mut self,
+        metrics: &StyledMetrics,
+        glyph_id: GlyphId,
+        bin: SubpixelBin,
+        hinting_target: skrifa::outline::Target,
+    ) -> Option<GlyphBitmap> {
+        // Color emoji fonts often have empty outlines next to their bitmap or `COLR` glyphs,
+        // so try those first:
+        core::cfg_select! {
+            feature = "color_fonts" => {
+                let location: skrifa::instance::LocationRef<'_> = (&metrics.location).into();
+                if let Some(bitmap) = self.rasterize_color_glyph(metrics, glyph_id, location) {
+                    return Some(bitmap);
+                }
+            }
+            _ => {}
         }
+
+        let path = self.draw_outline(metrics, glyph_id, bin, hinting_target)?;
+        let (bounds, width, height) = pixel_box(&path)?;
 
         let mut ctx = vello_cpu::RenderContext::new(width, height);
         ctx.set_transform(kurbo::Affine::translate((-bounds.x0, -bounds.y0)));
@@ -284,6 +293,15 @@ impl FontCell {
             is_color: true,
         })
     }
+}
+
+/// The whole-pixel box a glyph's outline `path` is rasterized into, with its width and height in
+/// pixels, or `None` when it covers no pixel.
+fn pixel_box(path: &kurbo::BezPath) -> Option<(kurbo::Rect, u16, u16)> {
+    let bounds = path.control_box().expand();
+    let width = bounds.width() as u16;
+    let height = bounds.height() as u16;
+    (width != 0 && height != 0).then_some((bounds, width, height))
 }
 
 /// Collects a `skrifa` glyph outline into a `kurbo` path, flipping Y to point down.
@@ -705,6 +723,28 @@ impl FontFace {
         let hinting_target = self.tweak.hinting_target.into();
         self.font
             .rasterize_glyph(metrics, glyph_id, bin, hinting_target)
+    }
+
+    /// The pixel box [`Self::rasterize_glyph`] would fill for a glyph without a color glyph,
+    /// without filling it: its offset from the glyph origin and its size, in pixels.
+    ///
+    /// Returns `None` when the glyph would have no bitmap.
+    #[cfg(feature = "glyph_paint")]
+    pub(crate) fn glyph_pixel_box(
+        &mut self,
+        metrics: &StyledMetrics,
+        glyph_id: GlyphId,
+        bin: SubpixelBin,
+    ) -> Option<(emath::Vec2, [usize; 2])> {
+        let hinting_target = self.tweak.hinting_target.into();
+        let path = self
+            .font
+            .draw_outline(metrics, glyph_id, bin, hinting_target)?;
+        let (bounds, width, height) = pixel_box(&path)?;
+        Some((
+            vec2(bounds.x0 as f32, bounds.y0 as f32),
+            [width as usize, height as usize],
+        ))
     }
 }
 

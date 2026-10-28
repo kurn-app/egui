@@ -85,6 +85,11 @@ pub struct Fonts {
     // root/child passes would then continuously evict one another's working sets.
     // Keep only the layout caches separate; font data and the glyph atlas stay shared.
     galley_caches: BTreeMap<ViewportKey, ViewportGalleyCache>,
+
+    /// Set when a glyph's bitmap is newly requested; [`Self::begin_pass`] then drops every
+    /// cached layout, so the glyph is laid out again with its bitmap.
+    #[cfg(feature = "glyph_paint")]
+    glyph_bitmaps_requested: bool,
 }
 
 impl Fonts {
@@ -95,7 +100,50 @@ impl Fonts {
         Self {
             fonts: FontsImpl::new(options, definitions),
             galley_caches: Default::default(),
+            #[cfg(feature = "glyph_paint")]
+            glyph_bitmaps_requested: false,
         }
+    }
+
+    /// Which glyphs layout prepares bitmaps for. See [`super::GlyphPaintMode`].
+    #[cfg(feature = "glyph_paint")]
+    #[inline]
+    pub fn glyph_paint_mode(&self) -> super::GlyphPaintMode {
+        self.fonts.glyphs.glyph_paint_mode()
+    }
+
+    /// Lay text out in `mode` from now on. See [`super::GlyphPaintMode`].
+    ///
+    /// A change drops every cached layout, and keeps the fonts, their
+    /// [`super::FontInstanceId`]s and the font atlas.
+    #[cfg(feature = "glyph_paint")]
+    pub fn set_glyph_paint_mode(&mut self, mode: super::GlyphPaintMode) {
+        if self.fonts.glyphs.set_glyph_paint_mode(mode) {
+            self.galley_caches.clear();
+        }
+    }
+
+    /// Give these glyphs, by font instance and glyph ID, their bitmaps in every
+    /// [`super::GlyphPaintMode`], at every size, for the life of these [`Fonts`].
+    ///
+    /// Returns how many were not requested before. If any is new, the next
+    /// [`Self::begin_pass`] drops every cached layout, so the glyphs are laid out again with
+    /// their bitmaps.
+    #[cfg(feature = "glyph_paint")]
+    pub fn request_glyph_bitmaps(
+        &mut self,
+        glyphs: impl IntoIterator<Item = (super::FontInstanceId, u32)>,
+    ) -> usize {
+        let new = self.fonts.glyphs.request_glyph_bitmaps(glyphs);
+        self.glyph_bitmaps_requested |= new > 0;
+        new
+    }
+
+    /// Bitmap work done for outline glyphs since these [`Fonts`] were created.
+    #[cfg(feature = "glyph_paint")]
+    #[inline]
+    pub fn glyph_paint_counters(&self) -> super::GlyphPaintCounters {
+        self.fonts.glyphs.glyph_paint_counters()
     }
 
     /// Also use this glyph rasterizer, e.g. the browser on web, or for custom glyphs.
@@ -182,6 +230,10 @@ impl Fonts {
             // The parsed faces are still fine; only the bitmaps need to go.
             self.fonts.glyphs.clear();
             self.galley_caches.clear(); // Galleys point into the old atlas.
+        }
+        #[cfg(feature = "glyph_paint")]
+        if core::mem::take(&mut self.glyph_bitmaps_requested) {
+            self.galley_caches.clear(); // Galleys lack the requested bitmaps.
         }
 
         let viewport_cache = self.galley_caches.entry(viewport_key).or_default();
@@ -503,6 +555,17 @@ pub(crate) struct FontsImpl {
     ///
     /// Kept as a [`GlyphRasterizer`] so its glyphs share the atlas cache with the other rasterized glyphs.
     synthetic_tofu: GlyphRasterizer,
+
+    /// Marks this row of every galley laid out in [`super::GlyphPaintMode::Outlines`]
+    /// [`super::GlyphPaintCheck::Malformed`], standing in for a row whose glyph paint does not
+    /// match its mesh.
+    #[cfg(all(test, feature = "glyph_paint"))]
+    pub(crate) malformed_outlines_row: Option<usize>,
+
+    /// Lays this character out as an invisible one, with no paint record, standing in for a font
+    /// that inks an invisible character.
+    #[cfg(all(test, feature = "glyph_paint"))]
+    pub(crate) invisible_test_char: Option<char>,
 }
 
 impl FontsImpl {
@@ -523,6 +586,10 @@ impl FontsImpl {
                 "epaint::synthetic_tofu",
                 |request: &GlyphRasterizerRequest<'_>| Some(synthetic_tofu(request.font_size_px)),
             ),
+            #[cfg(all(test, feature = "glyph_paint"))]
+            malformed_outlines_row: None,
+            #[cfg(all(test, feature = "glyph_paint"))]
+            invisible_test_char: None,
         };
         slf.set_font_providers(Vec::new());
         slf
@@ -549,7 +616,24 @@ impl FontsImpl {
     /// The parsed faces and the fallback chains survive; only the atlas starts over.
     pub fn set_options(&mut self, options: TextOptions) {
         self.faces.set_options(options);
-        self.glyphs = GlyphAtlas::new(options);
+        self.glyphs.reset(options);
+    }
+
+    #[cfg(feature = "glyph_paint")]
+    #[inline]
+    pub fn glyph_paint_mode(&self) -> super::GlyphPaintMode {
+        self.glyphs.glyph_paint_mode()
+    }
+
+    /// Lay glyphs out in `mode` from now on. See [`GlyphAtlas::set_glyph_paint_mode`].
+    #[cfg(feature = "glyph_paint")]
+    pub fn set_glyph_paint_mode(&mut self, mode: super::GlyphPaintMode) {
+        self.glyphs.set_glyph_paint_mode(mode);
+    }
+
+    #[cfg(all(test, feature = "glyph_paint"))]
+    pub fn glyphs(&self) -> &GlyphAtlas {
+        &self.glyphs
     }
 
     /// Also use this glyph rasterizer.

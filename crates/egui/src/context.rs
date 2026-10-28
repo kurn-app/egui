@@ -412,6 +412,14 @@ struct ContextImpl {
     /// so they are never dropped in the middle of one.
     reload_fonts: bool,
 
+    /// Applied to the [`Fonts`] at the start of each pass.
+    #[cfg(feature = "glyph_paint")]
+    glyph_paint_mode: epaint::text::GlyphPaintMode,
+
+    /// The totals of every [`Fonts`] this context has dropped.
+    #[cfg(feature = "glyph_paint")]
+    dropped_glyph_paint_counters: epaint::text::GlyphPaintCounters,
+
     memory: Memory,
     animation_manager: AnimationManager,
 
@@ -588,21 +596,21 @@ impl ContextImpl {
 
         if core::mem::take(&mut self.reload_fonts) {
             // The rasterizers or providers changed during the last pass.
-            self.fonts = None;
+            self.drop_fonts();
         }
 
         if let Some(font_definitions) = self.memory.new_font_definitions.take() {
             // New font definition loaded, so we need to reload all fonts.
-            self.fonts = None;
+            self.drop_fonts();
             self.font_definitions = font_definitions;
 
             log::trace!("Loading new font definitions");
         }
 
         if !self.memory.add_fonts.is_empty() {
+            self.drop_fonts();
             let fonts = self.memory.add_fonts.drain(..);
             for font in fonts {
-                self.fonts = None; // recreate all the fonts
                 for family in font.families {
                     let fam = self
                         .font_definitions
@@ -642,10 +650,22 @@ impl ContextImpl {
             fonts
         });
 
+        #[cfg(feature = "glyph_paint")]
+        fonts.set_glyph_paint_mode(self.glyph_paint_mode);
+
         {
             profiling::scope!("Fonts::begin_pass");
             fonts.begin_pass(text_options, ViewportKey::new(viewport_id.0.value()));
         }
+    }
+
+    /// Drop the [`Fonts`], to be created again at the next [`Self::update_fonts_mut`].
+    fn drop_fonts(&mut self) {
+        #[cfg(feature = "glyph_paint")]
+        if let Some(fonts) = &self.fonts {
+            self.dropped_glyph_paint_counters += fonts.glyph_paint_counters();
+        }
+        self.fonts = None;
     }
 
     fn accesskit_node_builder(&mut self, id: Id) -> Option<&mut accesskit::Node> {
@@ -1390,6 +1410,58 @@ impl Context {
                         ViewportKey::new(viewport_id.0.value()),
                     ),
             )
+        })
+    }
+
+    /// Which glyphs text layout prepares bitmaps for, from the start of the next pass on.
+    ///
+    /// See [`epaint::text::GlyphPaintMode`]. A change drops every cached layout, and keeps the
+    /// fonts, their [`epaint::text::FontInstanceId`]s and the font atlas.
+    #[cfg(feature = "glyph_paint")]
+    pub fn set_glyph_paint_mode(&self, mode: epaint::text::GlyphPaintMode) {
+        self.write(|ctx| ctx.glyph_paint_mode = mode);
+    }
+
+    /// The glyph paint mode set by [`Self::set_glyph_paint_mode`].
+    #[cfg(feature = "glyph_paint")]
+    pub fn glyph_paint_mode(&self) -> epaint::text::GlyphPaintMode {
+        self.read(|ctx| ctx.glyph_paint_mode)
+    }
+
+    /// Give these glyphs, by font instance and glyph ID, their bitmaps in every
+    /// [`epaint::text::GlyphPaintMode`], at every size, for the life of the current fonts.
+    ///
+    /// Returns how many were not requested before, and requests a repaint if any is new. At the
+    /// start of the next pass every cached layout is dropped, so text is laid out again with the
+    /// new bitmaps. Before the first pass there are no fonts, and nothing is requested.
+    #[cfg(feature = "glyph_paint")]
+    pub fn request_glyph_bitmaps(
+        &self,
+        glyphs: impl IntoIterator<Item = (epaint::text::FontInstanceId, u32)>,
+    ) -> usize {
+        let new = self.write(|ctx| {
+            ctx.fonts
+                .as_mut()
+                .map_or(0, |fonts| fonts.request_glyph_bitmaps(glyphs))
+        });
+        if new > 0 {
+            self.request_repaint();
+        }
+        new
+    }
+
+    /// Bitmap work done for outline glyphs since this context was created, across font reloads.
+    ///
+    /// See [`epaint::text::GlyphPaintCounters`].
+    #[cfg(feature = "glyph_paint")]
+    pub fn glyph_paint_counters(&self) -> epaint::text::GlyphPaintCounters {
+        self.read(|ctx| {
+            let current = ctx
+                .fonts
+                .as_ref()
+                .map(|fonts| fonts.glyph_paint_counters())
+                .unwrap_or_default();
+            ctx.dropped_glyph_paint_counters + current
         })
     }
 

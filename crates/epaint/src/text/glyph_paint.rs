@@ -22,6 +22,55 @@ pub enum GlyphPaintSource {
     Unsupported,
 }
 
+/// Which glyphs layout prepares bitmaps for.
+///
+/// Set with [`crate::text::Fonts::set_glyph_paint_mode`]. A painter that draws outline glyphs
+/// itself selects [`Self::Outlines`], so layout spends no rasterization, atlas space or upload on
+/// glyphs it never shows, and asks for the bitmaps of any it hands back to the stock path with
+/// [`crate::text::Fonts::request_glyph_bitmaps`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GlyphPaintMode {
+    /// Every glyph gets its bitmap, atlas slot and mesh quad, as without glyph paint.
+    #[default]
+    Bitmaps,
+    /// A glyph whose source is [`GlyphPaintSource::Outline`] or [`GlyphPaintSource::Empty`] gets
+    /// no bitmap, atlas slot or mesh quad, unless its bitmap was requested. Its
+    /// [`super::UvRect`] keeps the offset and size its bitmap would have, with an empty UV range,
+    /// so rows, positions, bounds and paint records are those of [`Self::Bitmaps`].
+    ///
+    /// A galley with a row whose [`GlyphPaintCheck`] is not separable is laid out again with
+    /// every bitmap.
+    Outlines,
+}
+
+/// Bitmap work done for glyphs a painter could draw from their outlines: totals since the
+/// [`crate::text::Fonts`] were created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlyphPaintCounters {
+    /// Rasterizations of a glyph whose paint source is [`GlyphPaintSource::Outline`], in either
+    /// [`GlyphPaintMode`].
+    pub outline_bitmaps: u64,
+    /// Font atlas texels those bitmaps take. The atlas uploads only allocated texels.
+    pub outline_bitmap_texels: u64,
+}
+
+impl core::ops::Add for GlyphPaintCounters {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            outline_bitmaps: self.outline_bitmaps + other.outline_bitmaps,
+            outline_bitmap_texels: self.outline_bitmap_texels + other.outline_bitmap_texels,
+        }
+    }
+}
+
+impl core::ops::AddAssign for GlyphPaintCounters {
+    fn add_assign(&mut self, other: Self) {
+        *self = *self + other;
+    }
+}
+
 /// The contiguous run of a row mesh's index list that draws its glyph quads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlyphIndexRange {
@@ -47,14 +96,15 @@ pub enum GlyphPaintCheck {
     /// [`Rect::NOTHING`] bounds, and each glyph with a stock quad has one. Those
     /// quads, four vertices each in glyph order, fill
     /// [`super::RowVisuals::glyph_vertex_range`], and their indices, six per
-    /// quad addressing only that quad, fill `glyphs`. Every other index
-    /// addresses a mesh vertex outside the glyph quads, and the indices before
-    /// `glyphs` are whole triangles.
+    /// quad addressing only that quad, fill `glyphs`, which starts at
+    /// [`super::RowVisuals::glyph_index_start`] and is empty there when no
+    /// glyph has a stock quad. Every other index addresses a mesh vertex
+    /// outside the glyph quads, and the indices before `glyphs` are whole
+    /// triangles.
     ///
     /// Triangles before `glyphs` (backgrounds, a selection highlight) paint
     /// under the glyphs, the rest (underline, strikethrough) over them. A
     /// painter may draw any occurrence itself and keep the others' stock quads.
-    /// With no stock quad, `glyphs` is empty at the end of the index list.
     Separable { glyphs: GlyphIndexRange },
     /// The paint occurrences or the mesh layout do not match the glyphs.
     Malformed,
@@ -80,14 +130,12 @@ impl super::Row {
             }
             previous = Some(paint.glyph_index);
         }
-        // The glyph run starts at the first index into the first quad, or at
-        // the end of the list when there is no quad.
-        let first_quad = quads.start..(quads.start + 4).min(quads.end);
-        let start = mesh
-            .indices
-            .iter()
-            .position(|&i| first_quad.contains(&(i as usize)))
-            .unwrap_or(mesh.indices.len());
+        // The glyph run starts where the row's glyph triangles start, with
+        // or without a quad.
+        let start = self.visuals.glyph_index_start;
+        if start > mesh.indices.len() {
+            return GlyphPaintCheck::Malformed;
+        }
         let mut paints = self.glyph_paint.iter().peekable();
         let (mut vertex, mut index) = (quads.start, start);
         for (glyph_index, glyph) in self.glyphs.iter().enumerate() {
@@ -108,7 +156,7 @@ impl super::Row {
             index += 6;
         }
         let end = index;
-        if vertex != quads.end || start % 3 != 0 {
+        if vertex != quads.end || !start.is_multiple_of(3) {
             return GlyphPaintCheck::Malformed;
         }
         let outside = mesh.indices[..start].iter().chain(&mesh.indices[end..]);
@@ -317,6 +365,41 @@ mod tests {
             edited(row, &|row| row.visuals.mesh.indices[0] = 4),
             GlyphPaintCheck::Malformed
         );
+        // A glyph run that does not start at `glyph_index_start`.
+        assert_eq!(
+            edited(decorated, &|row| row.visuals.glyph_index_start += 6),
+            GlyphPaintCheck::Malformed
+        );
+        assert_eq!(
+            edited(decorated, &|row| row.visuals.glyph_index_start -= 3),
+            GlyphPaintCheck::Malformed
+        );
+        assert_eq!(
+            edited(decorated, &|row| {
+                row.visuals.glyph_index_start = row.visuals.mesh.indices.len() + 3;
+            }),
+            GlyphPaintCheck::Malformed
+        );
+        // With no glyph quad, the run is empty at `glyph_index_start`, between the
+        // background and the decorations.
+        fonts.set_glyph_paint_mode(GlyphPaintMode::Outlines);
+        let mut bare = job("Wz");
+        bare.sections[0].format.background = Color32::GREEN;
+        bare.sections[0].format.underline = crate::Stroke::new(1.0, Color32::RED);
+        let bare = layout(&mut fonts, 1.0, Arc::new(bare));
+        let bare = &bare.rows[0].row;
+        assert!(bare.glyphs.iter().all(|glyph| glyph.uv_rect.is_nothing()));
+        let start = bare.visuals.glyph_index_start;
+        assert!(0 < start && start < bare.visuals.mesh.indices.len());
+        let empty = GlyphIndexRange {
+            start: start as u32,
+            end: start as u32,
+        };
+        assert_eq!(
+            bare.glyph_paint_check,
+            GlyphPaintCheck::Separable { glyphs: empty }
+        );
+        assert_eq!(separable(bare), empty);
         // Unserialized rows are never checked.
         assert_eq!(GlyphPaintCheck::default(), GlyphPaintCheck::Unchecked);
     }
@@ -725,5 +808,271 @@ mod tests {
             GlyphPaintSource::CustomRasterizer
         );
         assert!(tofu.rows[0].glyph_paint[0].font.is_none());
+    }
+
+    /// A job holding plain, italic and decorated text and a custom-rasterizer glyph, so a
+    /// galley's rows have outline glyphs, a kept quad, sheared quads and decorations.
+    fn mixed_job() -> LayoutJob {
+        let mut job = LayoutJob::default();
+        let font_id = FontId::proportional(17.0);
+        let plain = crate::text::TextFormat::simple(font_id.clone(), Color32::BLUE);
+        job.append("Ab ", 0.0, plain.clone());
+        job.append(
+            "jf ",
+            0.0,
+            crate::text::TextFormat {
+                italics: true,
+                ..plain.clone()
+            },
+        );
+        job.append(
+            "gq",
+            0.0,
+            crate::text::TextFormat {
+                background: Color32::GREEN,
+                underline: crate::Stroke::new(1.0, Color32::RED),
+                strikethrough: crate::Stroke::new(1.0, Color32::YELLOW),
+                ..plain
+            },
+        );
+        job
+    }
+
+    /// The galley-level layout both modes must agree on.
+    fn layout_reading(galley: &crate::text::Galley) -> impl PartialEq + core::fmt::Debug {
+        let rows: Vec<_> = galley
+            .rows
+            .iter()
+            .map(|row| {
+                let glyphs: Vec<_> = row
+                    .glyphs
+                    .iter()
+                    .map(|glyph| {
+                        (
+                            glyph.chr,
+                            glyph.pos,
+                            glyph.advance_width,
+                            glyph.uv_rect.offset,
+                            glyph.uv_rect.size,
+                        )
+                    })
+                    .collect();
+                (
+                    row.pos,
+                    row.size,
+                    glyphs,
+                    row.visuals.mesh_bounds,
+                    row.glyph_paint.to_vec(),
+                )
+            })
+            .collect();
+        (rows, galley.rect, galley.intrinsic_size, galley.mesh_bounds)
+    }
+
+    /// `bitmaps`' mesh without the quads of its `Outline` paint occurrences.
+    fn without_outline_quads(bitmaps: &super::super::Row) -> Mesh {
+        let mut kept = vec![true; bitmaps.visuals.mesh.vertices.len()];
+        for paint in bitmaps.glyph_paint.iter() {
+            let glyph = &bitmaps.glyphs[paint.glyph_index];
+            if paint.source == GlyphPaintSource::Outline && !glyph.uv_rect.is_nothing() {
+                let first = glyph.first_vertex as usize;
+                kept[first..first + 4].fill(false);
+            }
+        }
+        let mut renumbered = Vec::with_capacity(kept.len());
+        let mut mesh = Mesh::default();
+        for (vertex, &keep) in bitmaps.visuals.mesh.vertices.iter().zip(&kept) {
+            renumbered.push(mesh.vertices.len() as u32);
+            if keep {
+                mesh.vertices.push(*vertex);
+            }
+        }
+        mesh.indices = bitmaps
+            .visuals
+            .mesh
+            .indices
+            .iter()
+            .filter(|&&index| kept[index as usize])
+            .map(|&index| renumbered[index as usize])
+            .collect();
+        mesh
+    }
+
+    #[test]
+    fn outline_mode_layout_matches_bitmap_mode_without_outline_quads() {
+        let mut fonts = ubuntu(FontTweak::default()).with_glyph_rasterizer(raster(false));
+        fonts.set_glyph_paint_mode(GlyphPaintMode::Outlines);
+        let outlines = layout(&mut fonts, 1.0, Arc::new(mixed_job()));
+        assert_eq!(
+            fonts.glyphs().glyph_paint_counters(),
+            GlyphPaintCounters::default(),
+            "no outline glyph is rasterized"
+        );
+        fonts.set_glyph_paint_mode(GlyphPaintMode::Bitmaps);
+        let bitmaps = layout(&mut fonts, 1.0, Arc::new(mixed_job()));
+        let counters = fonts.glyphs().glyph_paint_counters();
+        assert!(counters.outline_bitmaps > 0 && counters.outline_bitmap_texels > 0);
+
+        assert_eq!(layout_reading(&outlines), layout_reading(&bitmaps));
+        let mut italic_pivots = 0;
+        let mut outline_glyphs = 0;
+        for (outline_row, bitmap_row) in outlines.rows.iter().zip(&bitmaps.rows) {
+            assert_eq!(outline_row.visuals.mesh, without_outline_quads(bitmap_row));
+            let glyphs = separable(outline_row);
+            assert_eq!(glyphs.start as usize, outline_row.visuals.glyph_index_start);
+            let kept = outline_row
+                .glyphs
+                .iter()
+                .filter(|glyph| !glyph.uv_rect.is_nothing())
+                .count();
+            assert_eq!(glyphs.end - glyphs.start, 6 * kept as u32);
+            for paint in outline_row.glyph_paint.iter() {
+                let glyph = &outline_row.glyphs[paint.glyph_index];
+                match paint.source {
+                    GlyphPaintSource::Outline => {
+                        outline_glyphs += 1;
+                        assert!(glyph.uv_rect.is_nothing() && glyph.uv_rect.size != Vec2::ZERO);
+                    }
+                    GlyphPaintSource::CustomRasterizer => {
+                        assert!(!glyph.uv_rect.is_nothing(), "a custom glyph keeps its quad");
+                    }
+                    _ => {}
+                }
+                italic_pivots += usize::from(paint.shear != 0.0);
+            }
+        }
+        assert_eq!(outline_glyphs, 5, "b, j, f, g and q");
+        assert_eq!(
+            italic_pivots, 2,
+            "j and f are sheared about their quads' bottoms"
+        );
+
+        // A row with no glyph quad and a shape underline draws the underline where the row
+        // with its quads does. It is laid out first, in outline mode, on fonts that have never
+        // seen its glyphs, so its mesh is empty.
+        let underline = crate::Stroke::new(1.0, Color32::RED);
+        let underlined = |fonts: &mut FontsImpl| {
+            let galley = Arc::new(layout(fonts, 1.0, Arc::new(job("bcd"))));
+            let shape = TextShape::new(pos2(3.0, 5.0), Arc::clone(&galley), Color32::WHITE)
+                .with_underline(underline);
+            let mut mesh = Mesh::default();
+            Tessellator::new(1.0, Default::default(), [1024, 1024], vec![])
+                .tessellate_text(&shape, &mut mesh);
+            let row = galley.rows[0].visuals.mesh.vertices.len();
+            let underline = mesh.vertices[row..]
+                .iter()
+                .map(|vertex| vertex.pos)
+                .collect::<Vec<_>>();
+            (galley, underline)
+        };
+        let mut fresh = ubuntu(FontTweak::default());
+        fresh.set_glyph_paint_mode(GlyphPaintMode::Outlines);
+        let (bare, without_quads) = underlined(&mut fresh);
+        let bare = &bare.rows[0];
+        assert!(bare.glyphs.iter().all(|glyph| glyph.uv_rect.is_nothing()));
+        assert!(bare.visuals.mesh.is_empty(), "the row has no mesh");
+        fresh.set_glyph_paint_mode(GlyphPaintMode::Bitmaps);
+        let (laid, with_quads) = underlined(&mut fresh);
+        assert!(
+            laid.rows[0]
+                .glyphs
+                .iter()
+                .all(|glyph| !glyph.uv_rect.is_nothing())
+        );
+        assert!(!with_quads.is_empty(), "the underline is drawn");
+        assert_eq!(without_quads, with_quads);
+    }
+
+    #[test]
+    fn outline_mode_relays_an_inked_invisible_character_with_bitmaps() {
+        let mut fonts = ubuntu(FontTweak::default());
+        fonts.set_glyph_paint_mode(GlyphPaintMode::Outlines);
+        let text = || Arc::new(job("Wb z"));
+
+        // Control: an invisible character whose glyph has no ink loses nothing, so the galley
+        // keeps its outline glyphs without quads.
+        fonts.invisible_test_char = Some(' ');
+        let bare = layout(&mut fonts, 1.0, text());
+        assert!(
+            bare.rows[0]
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.uv_rect.is_nothing())
+        );
+
+        // An invisible character with an inked glyph has no paint record, so only its bitmap
+        // draws it: the galley is laid out again with every bitmap.
+        fonts.invisible_test_char = Some('b');
+        let relaid = layout(&mut fonts, 1.0, text());
+        fonts.invisible_test_char = None;
+        assert_eq!(fonts.glyph_paint_mode(), GlyphPaintMode::Outlines);
+        let row = &relaid.rows[0];
+        let quads: Vec<_> = row
+            .glyphs
+            .iter()
+            .map(|glyph| (glyph.chr, !glyph.uv_rect.is_nothing()))
+            .collect();
+        assert_eq!(quads, [('W', true), ('b', true), (' ', false), ('z', true)]);
+        assert!(
+            row.glyph_paint.iter().all(|paint| paint.glyph_index != 1),
+            "the invisible character has no paint record"
+        );
+        assert_eq!(
+            row.glyph_paint_check,
+            GlyphPaintCheck::Malformed,
+            "as with every bitmap, its quad has no record"
+        );
+        assert_eq!(
+            fonts.glyphs().requested_glyph_bitmaps(),
+            0,
+            "no request made"
+        );
+    }
+
+    #[test]
+    fn outline_mode_relays_a_non_separable_galley_with_bitmaps() {
+        let mut fonts = ubuntu(FontTweak::default());
+        let bitmaps = layout(&mut fonts, 1.0, Arc::new(job("Ab cd")));
+        let before = fonts.glyphs().glyph_paint_counters();
+
+        fonts.set_glyph_paint_mode(GlyphPaintMode::Outlines);
+        // Control: a separable galley is laid out without outline quads.
+        let bare = layout(&mut fonts, 1.0, Arc::new(job("Wx yz")));
+        assert!(
+            bare.rows[0]
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.uv_rect.is_nothing())
+        );
+
+        fonts.malformed_outlines_row = Some(0);
+        let relaid = layout(&mut fonts, 1.0, Arc::new(job("Wx yz")));
+        fonts.malformed_outlines_row = None;
+        assert_eq!(fonts.glyph_paint_mode(), GlyphPaintMode::Outlines);
+        let row = &relaid.rows[0];
+        let boxed = row
+            .glyphs
+            .iter()
+            .filter(|glyph| glyph.uv_rect.size != Vec2::ZERO)
+            .count();
+        assert_eq!(boxed, 4, "every glyph but the space has a bitmap box");
+        assert!(
+            row.glyphs
+                .iter()
+                .filter(|glyph| glyph.uv_rect.size != Vec2::ZERO)
+                .all(|glyph| !glyph.uv_rect.is_nothing()),
+            "every glyph has its quad"
+        );
+        assert!(matches!(
+            row.glyph_paint_check,
+            GlyphPaintCheck::Separable { .. }
+        ));
+        assert_eq!(
+            fonts.glyphs().requested_glyph_bitmaps(),
+            0,
+            "no request made"
+        );
+        assert!(fonts.glyphs().glyph_paint_counters().outline_bitmaps > before.outline_bitmaps);
+        assert_eq!(bitmaps.rows[0].glyphs.len(), 5);
     }
 }
