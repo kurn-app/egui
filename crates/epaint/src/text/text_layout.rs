@@ -199,7 +199,7 @@ impl PaintLayout {
         if self.off {
             return;
         }
-        row.glyph_paint = row
+        let (paints, colors): (Vec<_>, Vec<_>) = row
             .glyphs
             .iter()
             .enumerate()
@@ -216,7 +216,6 @@ impl PaintLayout {
                     outline_scale: pending.scale,
                     shear: 0.0,
                     shear_origin_y: 0.0,
-                    color: format.color,
                     is_color: glyph.is_color
                         || pending.source == super::GlyphPaintSource::FontColor,
                     bounds: Rect::NOTHING,
@@ -254,9 +253,11 @@ impl PaintLayout {
                         paint.bounds.extend_with(corner);
                     }
                 }
-                Some(paint)
+                Some((paint, format.color))
             })
-            .collect();
+            .unzip();
+        row.glyph_paint = paints.into();
+        row.glyph_paint_colors = colors.into();
         row.glyph_paint_check = row.check_glyph_paint();
     }
 }
@@ -1010,6 +1011,8 @@ fn rows_from_paragraphs(
                     #[cfg(feature = "glyph_paint")]
                     glyph_paint: Default::default(),
                     #[cfg(feature = "glyph_paint")]
+                    glyph_paint_colors: Default::default(),
+                    #[cfg(feature = "glyph_paint")]
                     glyph_paint_check: Default::default(),
                     size: vec2(0.0, paragraph.empty_paragraph_height),
                 }),
@@ -1030,6 +1033,8 @@ fn rows_from_paragraphs(
                         visuals: Default::default(),
                         #[cfg(feature = "glyph_paint")]
                         glyph_paint: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
+                        glyph_paint_colors: Default::default(),
                         #[cfg(feature = "glyph_paint")]
                         glyph_paint_check: Default::default(),
                         size: vec2(paragraph_width, 0.0),
@@ -1087,6 +1092,8 @@ fn line_break(
                         #[cfg(feature = "glyph_paint")]
                         glyph_paint: Default::default(),
                         #[cfg(feature = "glyph_paint")]
+                        glyph_paint_colors: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
                         glyph_paint_check: Default::default(),
                         size: Vec2::ZERO,
                     }),
@@ -1116,6 +1123,8 @@ fn line_break(
                         visuals: Default::default(),
                         #[cfg(feature = "glyph_paint")]
                         glyph_paint: Default::default(),
+                        #[cfg(feature = "glyph_paint")]
+                        glyph_paint_colors: Default::default(),
                         #[cfg(feature = "glyph_paint")]
                         glyph_paint_check: Default::default(),
                         size: vec2(paragraph_max_x, 0.0),
@@ -1163,6 +1172,8 @@ fn line_break(
                     visuals: Default::default(),
                     #[cfg(feature = "glyph_paint")]
                     glyph_paint: Default::default(),
+                    #[cfg(feature = "glyph_paint")]
+                    glyph_paint_colors: Default::default(),
                     #[cfg(feature = "glyph_paint")]
                     glyph_paint_check: Default::default(),
                     size: vec2(paragraph_max_x - paragraph_min_x, 0.0),

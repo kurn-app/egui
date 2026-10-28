@@ -862,6 +862,16 @@ pub struct Row {
     #[cfg_attr(feature = "serde", serde(skip))]
     pub glyph_paint: Arc<[super::GlyphPaint]>,
 
+    /// The resolved section color of each [`Row::glyph_paint`] occurrence, in
+    /// the same order. Kept apart from the records so recoloring a row (fading,
+    /// a text selection) copies only the colors and shares the records.
+    /// Possibly [`Color32::PLACEHOLDER`]: resolve the color to paint with
+    /// [`crate::TextShape::glyph_paint_color`].
+    /// Not serialized: deserialized galleys use the stock bitmap rendering path.
+    #[cfg(feature = "glyph_paint")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub glyph_paint_colors: Arc<[Color32]>,
+
     /// [`Row::check_glyph_paint`] as layout computed it. Code that edits the
     /// row's glyphs, paint or mesh structure after layout recomputes it.
     /// Not serialized: a deserialized row is unchecked.

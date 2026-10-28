@@ -88,8 +88,9 @@ pub fn paint_text_selection(
                 mesh.vertices[vi].color = text_color;
             }
 
-            // Recolour the selected glyphs' paint records as their quads, so a
-            // painter drawing them from the records draws the selected colour.
+            // Recolour the selected glyphs' paint occurrences as their quads, so
+            // a painter drawing them from the records draws the selected colour.
+            // The records themselves stay shared.
             #[cfg(feature = "glyph_paint")]
             {
                 let selected = first_glyph_index..last_glyph_index;
@@ -98,9 +99,10 @@ pub fn paint_text_selection(
                     .iter()
                     .any(|paint| selected.contains(&paint.glyph_index))
                 {
-                    for paint in Arc::make_mut(&mut row.glyph_paint) {
+                    let colors = Arc::make_mut(&mut row.glyph_paint_colors);
+                    for (paint, color) in row.glyph_paint.iter().zip(colors) {
                         if selected.contains(&paint.glyph_index) {
-                            paint.color = text_color;
+                            *color = text_color;
                         }
                     }
                 }

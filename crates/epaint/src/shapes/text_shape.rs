@@ -129,18 +129,22 @@ impl TextShape {
                 * (row.pos.to_vec2() + self.glyph_paint_scale * local_pos.to_vec2())
     }
 
-    /// Resolve glyph paint color with the same placeholder, override, source-color
-    /// alpha, and gamma-space opacity rules as stock tessellation.
+    /// Resolve the color of the row's paint occurrence `occurrence` (an index into
+    /// [`text::Row::glyph_paint`]) with the same placeholder, override,
+    /// source-color alpha, and gamma-space opacity rules as stock tessellation.
+    ///
+    /// Panics if `occurrence` is out of range for the row's paint or colors.
     #[cfg(feature = "glyph_paint")]
-    pub fn glyph_paint_color(&self, paint: &text::GlyphPaint) -> Color32 {
+    pub fn glyph_paint_color(&self, row: &text::Row, occurrence: usize) -> Color32 {
+        let section_color = row.glyph_paint_colors[occurrence];
         let mut color = self.override_text_color.unwrap_or_else(|| {
-            if paint.color == Color32::PLACEHOLDER {
+            if section_color == Color32::PLACEHOLDER {
                 self.fallback_color
             } else {
-                paint.color
+                section_color
             }
         });
-        if paint.is_color {
+        if row.glyph_paint[occurrence].is_color {
             color = Color32::from_white_alpha(color.a());
         }
         if self.opacity_factor < 1.0 {
@@ -200,6 +204,8 @@ impl TextShape {
                 glyphs: _, // TODO(emilk): would it make sense to transform these?
                 #[cfg(feature = "glyph_paint")]
                     glyph_paint: _,
+                #[cfg(feature = "glyph_paint")]
+                    glyph_paint_colors: _,
                 #[cfg(feature = "glyph_paint")]
                     glyph_paint_check: _,
                 size,

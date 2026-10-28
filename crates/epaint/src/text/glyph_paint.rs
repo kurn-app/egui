@@ -4,7 +4,6 @@ use std::sync::Arc;
 use emath::{Pos2, Rect, Vec2};
 
 use super::FontPaintInstance;
-use crate::Color32;
 
 /// The source selected by layout, independently of bitmap atlas UV availability.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,7 +112,8 @@ pub enum GlyphPaintCheck {
     /// under the glyphs, the rest (underline, strikethrough) over them. A
     /// painter may draw any occurrence itself and keep the others' stock quads.
     Separable { glyphs: GlyphIndexRange },
-    /// The paint occurrences or the mesh layout do not match the glyphs.
+    /// The paint occurrences or the mesh layout do not match the glyphs, or
+    /// there is not one [`super::Row::glyph_paint_colors`] entry per occurrence.
     Malformed,
 }
 
@@ -125,6 +125,9 @@ impl super::Row {
         let mesh = &self.visuals.mesh;
         let quads = self.visuals.glyph_vertex_range.clone();
         if quads.start > quads.end || quads.end > mesh.vertices.len() {
+            return GlyphPaintCheck::Malformed;
+        }
+        if self.glyph_paint_colors.len() != self.glyph_paint.len() {
             return GlyphPaintCheck::Malformed;
         }
         let mut previous = None;
@@ -208,8 +211,6 @@ pub struct GlyphPaint {
     pub shear: f32,
     /// Row-local pivot for synthetic italic shear.
     pub shear_origin_y: f32,
-    /// Resolved section color, possibly PLACEHOLDER. Apply shape color overrides and opacity at paint time.
-    pub color: Color32,
     /// Whether stock painting preserves source RGB and applies only text alpha.
     pub is_color: bool,
     /// Conservative row-local visual bounds, independent of outline bitmap allocation.
@@ -237,7 +238,7 @@ mod tests {
         galley_cache::GalleyCache,
         text_layout::{ITALIC_SHEAR, layout},
     };
-    use crate::{Mesh, Shape, Tessellator, TextShape};
+    use crate::{Color32, Mesh, Shape, Tessellator, TextShape};
     use emath::{Rot2, TSTransform, pos2, vec2};
 
     fn ubuntu(tweak: FontTweak) -> FontsImpl {
@@ -334,6 +335,8 @@ mod tests {
         let with_paints = |row: &mut super::super::Row, edit: &dyn Fn(&mut Vec<GlyphPaint>)| {
             let mut paints = row.glyph_paint.to_vec();
             edit(&mut paints);
+            // One color per occurrence, so only the edited records can read malformed.
+            row.glyph_paint_colors = vec![Color32::BLUE; paints.len()].into();
             row.glyph_paint = paints.into();
         };
         // A background index moved into the second glyph's quad.
@@ -360,6 +363,13 @@ mod tests {
             edited(row, &|row| with_paints(row, &|p| {
                 p.remove(0);
             })),
+            GlyphPaintCheck::Malformed
+        );
+        // A paint occurrence without its color.
+        assert_eq!(
+            edited(row, &|row| {
+                row.glyph_paint_colors = row.glyph_paint_colors[1..].into();
+            }),
             GlyphPaintCheck::Malformed
         );
         // Non-finite paint bounds.
@@ -468,9 +478,13 @@ mod tests {
                 ),
             );
             assert_eq!(paint.outline_scale, vec2(scale, -scale));
-            assert_eq!(paint.color, Color32::BLUE);
             advance += position.x_advance as f32 * scale;
         }
+        assert!(
+            row.glyph_paint_colors
+                .iter()
+                .all(|&color| color == Color32::BLUE)
+        );
         let first_font = row.glyph_paint[0].font.as_ref().unwrap();
         assert!(
             row.glyph_paint
@@ -639,11 +653,12 @@ mod tests {
                 let mut mesh = Mesh::default();
                 Tessellator::new(1.0, Default::default(), [1024, 1024], vec![])
                     .tessellate_text(&shape, &mut mesh);
-                for paint in galley.rows[0].glyph_paint.iter() {
-                    let first_vertex =
-                        galley.rows[0].glyphs[paint.glyph_index].first_vertex as usize;
+                let row = &galley.rows[0];
+                assert_eq!(row.glyph_paint_colors[..], [color, color]);
+                for (occurrence, paint) in row.glyph_paint.iter().enumerate() {
+                    let first_vertex = row.glyphs[paint.glyph_index].first_vertex as usize;
                     assert_eq!(
-                        shape.glyph_paint_color(paint),
+                        shape.glyph_paint_color(row, occurrence),
                         mesh.vertices[first_vertex].color
                     );
                 }
@@ -740,10 +755,11 @@ mod tests {
     }
 
     #[test]
-    fn row_paint_color_adjustment_uses_copy_on_write() {
+    fn glyph_paint_color_adjustment_shares_paint_records() {
         let mut fonts = ubuntu(FontTweak::default());
-        let galley = Arc::new(layout(&mut fonts, 1.0, Arc::new(job("A"))));
-        let records = Arc::clone(&galley.rows[0].glyph_paint);
+        let galley = Arc::new(layout(&mut fonts, 1.0, Arc::new(job("AB"))));
+        let original = &galley.rows[0];
+        assert_eq!(original.glyph_paint.len(), 2);
         let mut shape = Shape::Text(TextShape::new(
             Pos2::ZERO,
             Arc::clone(&galley),
@@ -755,11 +771,30 @@ mod tests {
         let Shape::Text(shape) = shape else {
             unreachable!()
         };
-        assert_eq!(records[0].color, Color32::BLUE);
-        assert!(!Arc::ptr_eq(&records, &shape.galley.rows[0].glyph_paint));
-        let vertex = &shape.galley.rows[0].visuals.mesh.vertices[0];
-        assert_eq!(shape.galley.rows[0].glyph_paint[0].color, vertex.color);
-        assert_eq!(galley.rows[0].glyph_paint[0].color, Color32::BLUE);
+        let adjusted = &shape.galley.rows[0];
+        assert!(!Arc::ptr_eq(&original.row, &adjusted.row));
+        // The records are shared; only the colors were copied and adjusted.
+        assert!(Arc::ptr_eq(&original.glyph_paint, &adjusted.glyph_paint));
+        assert!(!Arc::ptr_eq(
+            &original.glyph_paint_colors,
+            &adjusted.glyph_paint_colors
+        ));
+        assert_eq!(original.glyph_paint_colors[..], [Color32::BLUE; 2]);
+        let faded = Color32::BLUE.gamma_multiply(0.5);
+        assert_eq!(adjusted.glyph_paint_colors[..], [faded; 2]);
+        for (occurrence, paint) in adjusted.glyph_paint.iter().enumerate() {
+            let vertex = adjusted.glyphs[paint.glyph_index].first_vertex as usize;
+            assert_eq!(
+                shape.glyph_paint_color(adjusted, occurrence),
+                adjusted.visuals.mesh.vertices[vertex].color
+            );
+        }
+        assert_eq!(
+            adjusted.glyph_paint_check,
+            GlyphPaintCheck::Separable {
+                glyphs: separable(adjusted)
+            }
+        );
     }
 
     #[test]
