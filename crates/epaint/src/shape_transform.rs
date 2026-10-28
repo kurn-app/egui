@@ -106,9 +106,13 @@ pub fn adjust_colors(
                 let galley = Arc::make_mut(galley);
                 for placed_row in &mut galley.rows {
                     let row = Arc::make_mut(&mut placed_row.row);
+                    // A row without paint occurrences keeps its shared empty colors,
+                    // which `make_mut` would otherwise copy.
                     #[cfg(feature = "glyph_paint")]
-                    for color in Arc::make_mut(&mut row.glyph_paint_colors) {
-                        adjust_color(color);
+                    if !row.glyph_paint_colors.is_empty() {
+                        for color in Arc::make_mut(&mut row.glyph_paint_colors) {
+                            adjust_color(color);
+                        }
                     }
                     for vertex in &mut row.visuals.mesh.vertices {
                         adjust_color(&mut vertex.color);
